@@ -19,7 +19,7 @@ from motion_vision.animation import (
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-def _gif_bytes(frames: int = 10, size: tuple[int, int] = (64, 48)) -> bytes:
+def _gif_bytes(frames: int = 10, size: tuple[int, int] = (64, 48), delay: int = 100) -> bytes:
     images = [Image.new("RGB", size, (index * 20 % 256, 40, 200)) for index in range(frames)]
     buffer = io.BytesIO()
     images[0].save(
@@ -27,7 +27,7 @@ def _gif_bytes(frames: int = 10, size: tuple[int, int] = (64, 48)) -> bytes:
         format="GIF",
         save_all=True,
         append_images=images[1:],
-        duration=100,
+        duration=delay,
         loop=0,
     )
     return buffer.getvalue()
@@ -75,7 +75,7 @@ def test_sample_animation_writes_downscaled_frames(tmp_path: Path) -> None:
     out_dir = tmp_path / "frames"
 
     sample = asyncio.run(
-        sample_animation(data, out_dir, max_side=64, quality=80, budget=lambda _t, _s: 5)
+        sample_animation(data, out_dir, max_side=64, quality=80, budget=lambda _t, _s, _d: 5)
     )
 
     assert sample.total_frames == 12
@@ -97,9 +97,36 @@ def test_sample_animation_writes_downscaled_frames(tmp_path: Path) -> None:
 def test_sample_animation_honours_budget(tmp_path: Path) -> None:
     data = _gif_bytes(frames=30)
     sample = asyncio.run(
-        sample_animation(data, tmp_path / "f", 32, 70, lambda total, _s: min(total, 3))
+        sample_animation(data, tmp_path / "f", 32, 70, lambda total, _s, _d: min(total, 3))
     )
     assert len(sample.frames) == 3
+
+
+def test_missing_frame_delays_still_produce_a_timeline(tmp_path: Path) -> None:
+    """帧延时写 0 的动图不能让所有时间戳都变成 0.0s。"""
+    data = _gif_bytes(frames=12, delay=0)
+    sample = asyncio.run(
+        sample_animation(data, tmp_path / "f", 64, 80, budget=lambda _t, _s, _d: 4)
+    )
+
+    stamps = [frame.timestamp for frame in sample.frames]
+    assert all(stamp is not None for stamp in stamps)
+    assert stamps == sorted(stamps)
+    assert len(set(stamps)) == len(stamps)
+    assert sample.duration is not None and sample.duration > 0
+
+
+def test_budget_receives_an_estimated_duration(tmp_path: Path) -> None:
+    seen: list[float | None] = []
+
+    def budget(total: int, _size: int, duration: float | None) -> int:
+        seen.append(duration)
+        return min(total, 3)
+
+    asyncio.run(sample_animation(_gif_bytes(frames=25, delay=80), tmp_path / "f", 64, 80, budget))
+
+    assert seen and seen[0] is not None
+    assert abs(seen[0] - 2.0) < 0.01
 
 
 def test_sample_animation_rejects_single_frame(tmp_path: Path) -> None:

@@ -2,7 +2,7 @@ name: astrbot_plugin_motion_vision
 display_name: 动态视觉 Motion Vision
 desc: 让大模型读懂动图和视频——自动抽取关键帧、可选提取语音，再连同说明一起交给模型。
 short_desc: 让大模型读懂动图和视频
-version: 0.2.0
+version: 0.3.0
 author: Whereis-Alice
 repo: https://github.com/Whereis-Alice/astrbot_plugin_motion_vision
 astrbot_version: ">=4.16,<5"

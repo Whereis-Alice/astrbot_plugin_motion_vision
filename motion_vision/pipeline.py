@@ -91,9 +91,13 @@ class MediaPipeline:
 
         out_dir = self.store.frames_dir("anim")
 
-        def budget(total_frames: int, size_bytes: int) -> int:
+        def budget(total_frames: int, size_bytes: int, duration: float | None) -> int:
             return animation_frame_budget(
-                total_frames, size_bytes, preset, self.settings.frames_override
+                total_frames,
+                size_bytes,
+                preset,
+                self.settings.animation_frames_override,
+                duration,
             )
 
         try:
@@ -149,7 +153,7 @@ class MediaPipeline:
         notice = ""
 
         if probe.has_video and remaining() > 5:
-            budget = video_frame_budget(probe.duration, preset, self.settings.frames_override)
+            budget = video_frame_budget(probe.duration, preset, self.settings.video_frames_override)
             windows = plan_extraction(probe.duration, budget)
             try:
                 frames = await self.runner.extract_frames(

@@ -44,7 +44,7 @@ EMPTY_MESSAGE_FALLBACK = "请看看我发的这段内容里有什么。"
     PLUGIN_NAME,
     "Whereis-Alice",
     "让大模型读懂动图和视频：自动抽取关键帧、可选提取语音，再连同说明一起交给模型。",
-    "0.2.0",
+    "0.3.0",
     "https://github.com/Whereis-Alice/astrbot_plugin_motion_vision",
 )
 class MotionVisionPlugin(Star):
@@ -245,10 +245,13 @@ class MotionVisionPlugin(Star):
             f"动图：{'开' if settings.animation.enabled else '关'}"
             f" / 视频：{'开' if settings.video.enabled else '关'}",
             f"细节档位：{DETAIL_LABELS.get(settings.detail_level, settings.detail_level)}"
-            f"（动图 {preset.animation_frames} 帧，视频约每 {preset.seconds_per_frame:g} 秒 1 帧、"
-            f"{preset.min_video_frames}~{preset.max_video_frames} 帧，"
-            f"最长边 {preset.max_side}px）",
-            f"帧数覆盖：{settings.frames_override or '未设置'}",
+            f"（最长边 {preset.max_side}px）",
+            f"　动图：约每 {preset.animation_seconds_per_frame:g} 秒 1 帧、"
+            f"{preset.min_animation_frames}~{preset.max_animation_frames} 帧"
+            f"（覆盖：{settings.animation_frames_override or '未设置'}）",
+            f"　视频：约每 {preset.video_seconds_per_frame:g} 秒 1 帧、"
+            f"{preset.min_video_frames}~{preset.max_video_frames} 帧"
+            f"（覆盖：{settings.video_frames_override or '未设置'}）",
             f"ffmpeg：{ffmpeg_state}",
             f"音频模式：{AUDIO_LABELS.get(settings.audio.mode, settings.audio.mode)}",
             f"语音转写：{describe_backend(self.context, settings.audio)}",

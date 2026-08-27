@@ -32,6 +32,9 @@ UNKNOWN_DURATION_INTERVAL = 2.0
 
 MIN_ANIMATION_FRAMES = 2
 
+ASSUMED_ANIMATION_FPS = 10.0
+"""动图没写帧延时时的假定帧率，用来把帧数换算成时长。"""
+
 
 @dataclass(frozen=True)
 class ExtractionWindow:
@@ -79,27 +82,48 @@ def sample_indices(total: int, target: int) -> list[int]:
 
 
 def animation_frame_budget(
-    total_frames: int, size_bytes: int, preset: DetailPreset, override: int = 0
+    total_frames: int,
+    size_bytes: int,
+    preset: DetailPreset,
+    override: int = 0,
+    duration: float | None = None,
 ) -> int:
     """决定一张动图抽多少帧。
 
-    体量越大越保守：>=5MB 减一帧，>=10MB 减两帧，但至少保留 2 帧
-    （只剩 1 帧就等于没抽帧了）。
+    和视频一样按密度算：动图的时长差别很大，两秒的表情包和二十秒的短动画
+    如果都只给 6 帧，后者等于每 3 秒才看一眼。时长未知时用帧数按假定帧率
+    倒推，至少不会把长动图当成短表情包。
+
+    额外的两道保护：源帧数不够时以源为准（4 帧的图抽 6 帧没有意义），
+    文件体量大时按比例收敛，但至少保留 2 帧——只剩 1 帧就等于没抽帧了。
     """
     if total_frames <= 1:
         return min(1, max(total_frames, 0))
 
-    base = override if override > 0 else preset.animation_frames
-    target = min(base, total_frames, HARD_MAX_FRAMES_PER_MEDIA)
+    ceiling = min(preset.max_animation_frames, HARD_MAX_FRAMES_PER_MEDIA, total_frames)
+    floor = min(preset.min_animation_frames, ceiling)
+
+    if override > 0:
+        target = min(override, HARD_MAX_FRAMES_PER_MEDIA, total_frames)
+    else:
+        seconds = duration if duration and duration > 0 else total_frames / ASSUMED_ANIMATION_FPS
+        wanted = math.ceil(seconds / max(preset.animation_seconds_per_frame, 0.05))
+        target = max(floor, min(wanted, ceiling))
+
     if total_frames <= 4:
         target = min(target, 3)
-
-    if size_bytes >= 10 * MB:
-        target -= 2
-    elif size_bytes >= 5 * MB:
-        target -= 1
+    target = _shrink_for_size(target, size_bytes)
 
     return max(MIN_ANIMATION_FRAMES, min(target, total_frames))
+
+
+def _shrink_for_size(target: int, size_bytes: int) -> int:
+    """大文件按比例减帧：固定减 1~2 帧对 30 帧的预算等于没减。"""
+    if size_bytes >= 10 * MB:
+        return round(target * 0.5)
+    if size_bytes >= 5 * MB:
+        return round(target * 0.75)
+    return target
 
 
 def video_frame_budget(duration: float | None, preset: DetailPreset, override: int = 0) -> int:
@@ -118,7 +142,7 @@ def video_frame_budget(duration: float | None, preset: DetailPreset, override: i
         # 时长未知，按兜底间隔估一个中等规模，别一上来就顶到上限。
         return max(floor, min(ceiling, floor * 2))
 
-    wanted = math.ceil(duration / max(preset.seconds_per_frame, 0.1))
+    wanted = math.ceil(duration / max(preset.video_seconds_per_frame, 0.1))
     return max(floor, min(wanted, ceiling))
 
 

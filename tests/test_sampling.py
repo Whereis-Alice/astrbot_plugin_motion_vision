@@ -30,15 +30,44 @@ def test_animation_budget_respects_source_length():
     preset = DETAIL_PRESETS["balanced"]
     assert animation_frame_budget(1, 0, preset) == 1
     assert animation_frame_budget(0, 0, preset) == 0
-    # 只有 3 帧的动图不可能抽出 5 帧
+    # 只有 3 帧的动图不可能抽出 6 帧
     assert animation_frame_budget(3, 0, preset) == 3
+
+
+def test_animation_budget_follows_duration_not_just_a_flat_count():
+    preset = DETAIL_PRESETS["balanced"]
+    short = animation_frame_budget(20, 0, preset, duration=2.0)
+    long = animation_frame_budget(200, 0, preset, duration=20.0)
+
+    # 2 秒的表情包按下限给，20 秒的短动画必须明显更多，否则等于每 3 秒看一眼
+    assert short == preset.min_animation_frames
+    assert long > short * 2
+    assert long <= preset.max_animation_frames
+
+
+def test_animation_budget_reaches_thirty_on_detailed():
+    preset = DETAIL_PRESETS["detailed"]
+    assert preset.max_animation_frames == 30
+    assert animation_frame_budget(300, 0, preset, duration=20.0) == 30
+
+
+def test_animation_budget_estimates_duration_from_frame_count():
+    preset = DETAIL_PRESETS["balanced"]
+    # 时长未知时按假定帧率倒推：200 帧 ≈ 20 秒，不该被当成两秒的表情包
+    assert animation_frame_budget(200, 0, preset) > animation_frame_budget(20, 0, preset)
+
+
+def test_animation_budget_is_capped_by_the_preset_ceiling():
+    for name, preset in DETAIL_PRESETS.items():
+        budget = animation_frame_budget(600, 0, preset, duration=600.0)
+        assert budget == preset.max_animation_frames, name
 
 
 def test_animation_budget_backs_off_for_large_files():
     preset = DETAIL_PRESETS["detailed"]
-    plain = animation_frame_budget(60, 0, preset)
-    medium = animation_frame_budget(60, 6 * MB, preset)
-    huge = animation_frame_budget(60, 12 * MB, preset)
+    plain = animation_frame_budget(60, 0, preset, duration=6.0)
+    medium = animation_frame_budget(60, 6 * MB, preset, duration=6.0)
+    huge = animation_frame_budget(60, 12 * MB, preset, duration=6.0)
 
     assert plain > medium > huge
     assert huge >= 2
@@ -52,6 +81,13 @@ def test_animation_budget_never_drops_below_two():
 def test_animation_override_wins():
     preset = DETAIL_PRESETS["frugal"]
     assert animation_frame_budget(40, 0, preset, override=9) == 9
+    # 覆盖值也不能超过源帧数
+    assert animation_frame_budget(5, 0, preset, override=30) == 5
+
+
+def test_animation_and_video_densities_are_independent():
+    for name, preset in DETAIL_PRESETS.items():
+        assert preset.animation_seconds_per_frame < preset.video_seconds_per_frame, name
 
 
 def test_video_budget_follows_target_interval():

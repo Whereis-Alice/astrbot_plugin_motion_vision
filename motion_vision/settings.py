@@ -19,13 +19,26 @@ HARD_MAX_FRAMES_PER_MEDIA = 64
 class DetailPreset:
     """一档画质/密度预设。
 
-    视频帧数不写死，而是由「目标采样间隔」乘时长算出来，再夹在上下限之间：
-    短片不会浪费额度，长片也不会出现「两小时给 20 帧」这种名不副实的情况。
+    帧数都不写死，而是由「目标采样间隔」乘时长算出来，再夹在上下限之间：
+    短的不浪费额度，长的也不会出现「两小时给 20 帧」这种名不副实的情况。
+
+    动图和视频各有一套密度参数。两者的形态差别很大——表情包往往只有一两秒
+    但动作全在这一两秒里，视频则可能长达几十分钟——用同一组数值必然有一头
+    照顾不到。
     """
 
     name: str
-    animation_frames: int
-    seconds_per_frame: float
+
+    animation_seconds_per_frame: float
+    """动图的目标采样间隔：每隔这么多秒希望有 1 帧。"""
+
+    min_animation_frames: int
+    """再短的动图也至少给这么多帧（源帧数不够时以源为准）。"""
+
+    max_animation_frames: int
+    """帧数再多的动图也不超过这么多帧。"""
+
+    video_seconds_per_frame: float
     """视频的目标采样间隔：每隔这么多秒希望有 1 帧。"""
 
     min_video_frames: int
@@ -39,9 +52,9 @@ class DetailPreset:
 
 
 DETAIL_PRESETS: dict[str, DetailPreset] = {
-    "frugal": DetailPreset("frugal", 3, 8.0, 4, 14, 512, 80),
-    "balanced": DetailPreset("balanced", 6, 3.0, 6, 28, 768, 85),
-    "detailed": DetailPreset("detailed", 10, 1.5, 10, 48, 1024, 90),
+    "frugal": DetailPreset("frugal", 1.2, 3, 10, 8.0, 4, 14, 512, 80),
+    "balanced": DetailPreset("balanced", 0.6, 6, 20, 3.0, 6, 28, 768, 85),
+    "detailed": DetailPreset("detailed", 0.35, 10, 30, 1.5, 10, 48, 1024, 90),
 }
 DEFAULT_DETAIL_LEVEL = "balanced"
 
@@ -129,7 +142,8 @@ class AdvancedSettings:
 class Settings:
     enabled: bool = True
     detail_level: str = DEFAULT_DETAIL_LEVEL
-    frames_override: int = 0
+    animation_frames_override: int = 0
+    video_frames_override: int = 0
     animation: AnimationSettings = field(default_factory=AnimationSettings)
     video: VideoSettings = field(default_factory=VideoSettings)
     audio: AudioSettings = field(default_factory=AudioSettings)
@@ -145,8 +159,8 @@ class Settings:
         """影响抽帧产物的配置指纹，用于缓存键。"""
         preset = self.preset
         return (
-            f"{preset.name}:{self.frames_override}:{preset.max_side}"
-            f":{preset.jpeg_quality}:{self.audio.mode}"
+            f"{preset.name}:{self.animation_frames_override}:{self.video_frames_override}"
+            f":{preset.max_side}:{preset.jpeg_quality}:{self.audio.mode}"
         )
 
 
@@ -213,6 +227,9 @@ def load_settings(config: Any) -> Settings:
     injection = _section(raw, "injection")
     advanced = _section(raw, "advanced")
 
+    # 0.2.x 只有一个共用的 frames_override，升级上来时沿用它当两边的初值。
+    legacy_override = sampling.get("frames_override", 0)
+
     return Settings(
         enabled=_as_bool(raw.get("enabled"), True),
         detail_level=_as_choice(
@@ -221,7 +238,18 @@ def load_settings(config: Any) -> Settings:
             DEFAULT_DETAIL_LEVEL,
             DETAIL_ALIASES,
         ),
-        frames_override=_as_int(sampling.get("frames_override"), 0, 0, HARD_MAX_FRAMES_PER_MEDIA),
+        animation_frames_override=_as_int(
+            sampling.get("animation_frames_override", legacy_override),
+            0,
+            0,
+            HARD_MAX_FRAMES_PER_MEDIA,
+        ),
+        video_frames_override=_as_int(
+            sampling.get("video_frames_override", legacy_override),
+            0,
+            0,
+            HARD_MAX_FRAMES_PER_MEDIA,
+        ),
         animation=AnimationSettings(
             enabled=_as_bool(animation.get("enabled"), True),
         ),

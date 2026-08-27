@@ -7,7 +7,6 @@ QQ 上的表情包早就不只有 GIF 了，动态 WebP 和 APNG 同样常见，
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import io
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,6 +26,12 @@ MAX_PIXELS_PER_FRAME = 50_000_000
 
 GIF_MAGICS = (b"GIF87a", b"GIF89a")
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+DEFAULT_FRAME_DELAY_MS = 100.0
+"""帧延时缺失或写得离谱时的取值——和浏览器的处理一致。"""
+
+MIN_CREDIBLE_DELAY_MS = 20.0
+"""小于这个值的帧延时视为「没写」：不少 GIF 会填 0 或 10ms。"""
 
 
 class AnimationError(RuntimeError):
@@ -96,7 +101,7 @@ def _sample_sync(
     out_dir: Path,
     max_side: int,
     quality: int,
-    budget: Callable[[int, int], int],
+    budget: Callable[[int, int, float | None], int],
 ) -> AnimationSample:
     size_bytes = len(source) if isinstance(source, bytes) else _size_of(source)
 
@@ -108,7 +113,7 @@ def _sample_sync(
         if image.size[0] * image.size[1] > MAX_PIXELS_PER_FRAME:
             raise AnimationError("图片分辨率过高，已跳过")
 
-        target = budget(total_frames, size_bytes)
+        target = budget(total_frames, size_bytes, _estimate_duration(image, total_frames))
         wanted = set(sample_indices(total_frames, target))
         if not wanted:
             raise AnimationError("采样帧数为 0，已跳过")
@@ -134,8 +139,7 @@ def _sample_sync(
                         size_bytes=_size_of(target_path),
                     )
                 )
-            with contextlib.suppress(TypeError, ValueError):
-                elapsed_ms += float(raw_frame.info.get("duration") or 0.0)
+            elapsed_ms += _frame_delay_ms(raw_frame)
 
     if not frames:
         raise AnimationError("没能抽出任何帧")
@@ -154,10 +158,34 @@ async def sample_animation(
     out_dir: Path,
     max_side: int,
     quality: int,
-    budget: Callable[[int, int], int],
+    budget: Callable[[int, int, float | None], int],
 ) -> AnimationSample:
     """抽帧并落盘成 JPEG。Pillow 是同步的，整段丢进线程池。"""
     return await asyncio.to_thread(_sample_sync, source, out_dir, max_side, quality, budget)
+
+
+def _frame_delay_ms(frame: Image.Image) -> float:
+    """单帧显示时长。写 0 或写得离谱的一律按 100ms 算。
+
+    不做这个兜底的话，一整张 GIF 的时间戳会全是 0.0s，模型看到的每个标签都是
+    「@0.0s」，等于没有时间信息。
+    """
+    try:
+        delay = float(frame.info.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        delay = 0.0
+    return delay if delay >= MIN_CREDIBLE_DELAY_MS else DEFAULT_FRAME_DELAY_MS
+
+
+def _estimate_duration(image: Image.Image, total_frames: int) -> float | None:
+    """在真正遍历之前估个总时长，供帧数预算参考。
+
+    只看第一帧的延时再乘帧数：绝大多数动图的帧延时是统一的，而逐帧读延时
+    等于把整张图解码两遍。估得准不准只影响「抽几帧」，不影响帧本身的时间戳
+    ——那个是遍历时按真实延时累加出来的。
+    """
+    seconds = total_frames * _frame_delay_ms(image) / 1000.0
+    return seconds if seconds > 0 else None
 
 
 def _size_of(path: Path) -> int:
