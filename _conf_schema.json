@@ -1,0 +1,192 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后插件不再处理任何动图和视频，其余配置保持不变。"
+  },
+  "sampling": {
+    "description": "取帧策略",
+    "type": "object",
+    "hint": "决定给模型看多少张画面。看得越多越准，但每张图都要花 token。",
+    "items": {
+      "detail_level": {
+        "description": "细节档位",
+        "type": "string",
+        "default": "均衡",
+        "options": [
+          "节省",
+          "均衡",
+          "精细"
+        ],
+        "hint": "节省：动图 3 帧 / 视频 6 帧 / 最长边 512px，适合成本敏感或量大的场景。均衡：动图 5 帧 / 视频 12 帧 / 最长边 768px，推荐默认。精细：动图 8 帧 / 视频 20 帧 / 最长边 1024px，适合需要看清细节的场景。超过 1 分钟的视频会自动多给一些帧。"
+      },
+      "frames_override": {
+        "description": "手动指定帧数",
+        "type": "int",
+        "default": 0,
+        "hint": "填 0 表示跟随上面的档位。只有在你明确知道自己要几帧时才填，最大 64。"
+      }
+    }
+  },
+  "animation": {
+    "description": "动图（GIF / 动态 WebP / APNG）",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "解析动图",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，聊天里的动图会被拆成若干静态帧再交给模型；静态图片不受影响。"
+      }
+    }
+  },
+  "video": {
+    "description": "视频",
+    "type": "object",
+    "hint": "视频功能依赖服务器上的 ffmpeg，没有装的话这一组配置不会生效。",
+    "items": {
+      "enabled": {
+        "description": "解析视频",
+        "type": "bool",
+        "default": true,
+        "hint": "涵盖直接发送的视频、群文件里的视频，以及引用别人消息里的视频。"
+      },
+      "max_videos_per_request": {
+        "description": "单条消息最多处理几个视频",
+        "type": "int",
+        "default": 2,
+        "hint": "一次发一堆视频时的保护上限，超出的会被忽略。"
+      },
+      "max_download_mb": {
+        "description": "单个视频最大体积（MB）",
+        "type": "int",
+        "default": 100,
+        "hint": "需要联网下载的视频超过这个体积就跳过，避免拖垮带宽和磁盘。"
+      },
+      "include_group_files": {
+        "description": "读取群文件里的视频",
+        "type": "bool",
+        "default": true,
+        "hint": "仅 QQ（OneBot）平台有效。关闭后只处理直接作为视频消息发送的内容。"
+      }
+    }
+  },
+  "audio": {
+    "description": "声音",
+    "type": "object",
+    "hint": "画面之外，视频里的说话内容往往才是重点。",
+    "items": {
+      "mode": {
+        "description": "处理方式",
+        "type": "string",
+        "default": "关闭",
+        "options": [
+          "关闭",
+          "附带音轨",
+          "转写文字",
+          "音轨和文字"
+        ],
+        "hint": "附带音轨：把声音原样交给模型，只有支持听音频的模型才有用。转写文字：先转成文字再交给模型，任何模型都能用，需要下面的语音识别配置。"
+      },
+      "stt_provider_id": {
+        "description": "语音识别服务商",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider_stt",
+        "hint": "选一个 AstrBot 里已经配好的语音识别服务即可；留空则使用当前启用的那个。"
+      },
+      "api_base": {
+        "description": "自定义转写接口地址",
+        "type": "string",
+        "default": "",
+        "hint": "上面选不到合适的服务时才需要填。填 OpenAI 兼容的地址，例如 https://api.openai.com/v1 。"
+      },
+      "api_key": {
+        "description": "自定义转写接口密钥",
+        "type": "string",
+        "default": "",
+        "hint": "仅在使用自定义接口时需要。"
+      },
+      "model": {
+        "description": "自定义转写模型",
+        "type": "string",
+        "default": "whisper-1",
+        "hint": "仅在使用自定义接口时需要，例如 whisper-1。"
+      },
+      "max_transcript_chars": {
+        "description": "转写文字最多保留多少字",
+        "type": "int",
+        "default": 800,
+        "hint": "超长的转写结果会被截断，防止一段长视频把上下文占满。"
+      }
+    }
+  },
+  "injection": {
+    "description": "交给模型的方式",
+    "type": "object",
+    "items": {
+      "notice_enabled": {
+        "description": "解析失败时告知模型",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，遇到读不了的视频会附一句说明，模型就会老实说看不到，而不是凭空编内容。"
+      },
+      "keep_frames_in_history": {
+        "description": "把画面保留在对话历史里",
+        "type": "bool",
+        "default": false,
+        "hint": "默认只在当轮生效，之后自动移除，长对话不会被几十张图撑爆。需要模型在后续追问中还记得画面时再开启。"
+      },
+      "extra_guidance": {
+        "description": "追加提示词",
+        "type": "text",
+        "default": "",
+        "hint": "会附在画面后面的一段自定义说明，例如「重点描述人物动作」。留空即可。"
+      }
+    }
+  },
+  "advanced": {
+    "description": "高级",
+    "type": "object",
+    "hint": "一般不需要改动。",
+    "items": {
+      "ffmpeg_path": {
+        "description": "ffmpeg 路径",
+        "type": "string",
+        "default": "",
+        "hint": "留空表示自动查找。可以填 ffmpeg 可执行文件本身，也可以填它所在的目录。"
+      },
+      "max_images_per_request": {
+        "description": "单轮最多送出几张画面",
+        "type": "int",
+        "default": 32,
+        "hint": "所有动图和视频加起来的总张数上限。"
+      },
+      "max_frame_payload_mb": {
+        "description": "单轮画面总体积上限（MB）",
+        "type": "int",
+        "default": 15,
+        "hint": "超出后会从后面的媒体开始削减帧数，优先保住第一个媒体。"
+      },
+      "max_seconds_per_video": {
+        "description": "单个视频最长处理时间（秒）",
+        "type": "int",
+        "default": 180,
+        "hint": "超时会带着已经拿到的画面继续，不会让对话一直卡着。"
+      },
+      "temp_retention_hours": {
+        "description": "临时文件保留时长（小时）",
+        "type": "int",
+        "default": 6,
+        "hint": "抽出的帧会缓存这么久，重复提问同一个视频时可以直接复用，不必再抽一遍。"
+      },
+      "debug_log": {
+        "description": "输出详细日志",
+        "type": "bool",
+        "default": false,
+        "hint": "排查问题时开启，会在日志里打印完整的错误堆栈。"
+      }
+    }
+  }
+}
