@@ -14,26 +14,34 @@ MB = 1024 * 1024
 HARD_MAX_FRAMES_PER_MEDIA = 64
 """单个媒体的绝对帧数上限，防止配置写飞。"""
 
-LONG_VIDEO_SECONDS = 60.0
-"""超过这个时长按「长视频」预算给帧。"""
-
 
 @dataclass(frozen=True)
 class DetailPreset:
-    """一档画质/密度预设。"""
+    """一档画质/密度预设。
+
+    视频帧数不写死，而是由「目标采样间隔」乘时长算出来，再夹在上下限之间：
+    短片不会浪费额度，长片也不会出现「两小时给 20 帧」这种名不副实的情况。
+    """
 
     name: str
     animation_frames: int
-    video_frames: int
-    long_video_frames: int
+    seconds_per_frame: float
+    """视频的目标采样间隔：每隔这么多秒希望有 1 帧。"""
+
+    min_video_frames: int
+    """再短的视频也至少给这么多帧。"""
+
+    max_video_frames: int
+    """再长的视频也不超过这么多帧（成本闸门）。"""
+
     max_side: int
     jpeg_quality: int
 
 
 DETAIL_PRESETS: dict[str, DetailPreset] = {
-    "frugal": DetailPreset("frugal", 3, 6, 10, 512, 80),
-    "balanced": DetailPreset("balanced", 5, 12, 20, 768, 85),
-    "detailed": DetailPreset("detailed", 8, 20, 32, 1024, 90),
+    "frugal": DetailPreset("frugal", 3, 8.0, 4, 14, 512, 80),
+    "balanced": DetailPreset("balanced", 6, 3.0, 6, 28, 768, 85),
+    "detailed": DetailPreset("detailed", 10, 1.5, 10, 48, 1024, 90),
 }
 DEFAULT_DETAIL_LEVEL = "balanced"
 
@@ -110,8 +118,8 @@ class InjectionSettings:
 @dataclass(frozen=True)
 class AdvancedSettings:
     ffmpeg_path: str = ""
-    max_images_per_request: int = 32
-    max_frame_payload_mb: int = 15
+    max_images_per_request: int = 48
+    max_frame_payload_mb: int = 20
     max_seconds_per_video: int = 180
     temp_retention_hours: int = 6
     debug_log: bool = False
@@ -238,8 +246,8 @@ def load_settings(config: Any) -> Settings:
         ),
         advanced=AdvancedSettings(
             ffmpeg_path=_as_str(advanced.get("ffmpeg_path")),
-            max_images_per_request=_as_int(advanced.get("max_images_per_request"), 32, 1, 200),
-            max_frame_payload_mb=_as_int(advanced.get("max_frame_payload_mb"), 15, 1, 500),
+            max_images_per_request=_as_int(advanced.get("max_images_per_request"), 48, 1, 200),
+            max_frame_payload_mb=_as_int(advanced.get("max_frame_payload_mb"), 20, 1, 500),
             max_seconds_per_video=_as_int(advanced.get("max_seconds_per_video"), 180, 15, 1800),
             temp_retention_hours=_as_int(advanced.get("temp_retention_hours"), 6, 1, 168),
             debug_log=_as_bool(advanced.get("debug_log"), False),

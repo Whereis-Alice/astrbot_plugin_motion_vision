@@ -17,7 +17,9 @@ from .models import MediaItem, MediaKind, MediaResult, SampledFrame
 from .sampling import (
     animation_frame_budget,
     audio_clip_seconds,
+    fair_allocation,
     plan_extraction,
+    thin_indices,
     video_frame_budget,
 )
 from .settings import MB, Settings
@@ -226,24 +228,52 @@ class MediaPipeline:
     def _apply_payload_budget(self, results: list[MediaResult]) -> None:
         """限制整轮请求送出去的图片张数与总字节数。
 
-        超预算时从后往前砍：先保住第一个媒体的完整性，因为它通常是用户真正在问的。
-        """
-        max_images = self.settings.advanced.max_images_per_request
-        max_bytes = self.settings.advanced.max_frame_payload_mb * MB
+        两条原则：
 
-        used_images = 0
-        used_bytes = 0
-        for result in results:
-            kept: list[SampledFrame] = []
-            for frame in result.frames:
-                size = frame.size_bytes or 0
-                if used_images + 1 > max_images or used_bytes + size > max_bytes:
-                    continue
-                used_images += 1
-                used_bytes += size
-                kept.append(frame)
-            if len(kept) != len(result.frames):
-                dropped = len(result.frames) - len(kept)
-                result.frames = kept
-                extra = f"因图片预算限制，已丢弃 {dropped} 张帧"
-                result.notice = f"{result.notice}；{extra}" if result.notice else extra
+        * **公平**：多个媒体时按份额均分，不让第一个视频吃光整轮预算，
+          否则后面的视频会一帧都拿不到。
+        * **均匀**：需要砍帧时沿时间轴抽稀，而不是把片尾整段丢掉——
+          丢掉结尾等于让模型只看了个开头。
+        """
+        carriers = [result for result in results if result.frames]
+        if not carriers:
+            return
+
+        original = [len(result.frames) for result in carriers]
+
+        # 1) 张数预算
+        allowance = fair_allocation(original, self.settings.advanced.max_images_per_request)
+        for result, keep in zip(carriers, allowance, strict=True):
+            self._thin(result, keep)
+
+        # 2) 字节预算：还超就按同一比例继续抽稀
+        max_bytes = self.settings.advanced.max_frame_payload_mb * MB
+        total_bytes = sum(frame.size_bytes or 0 for result in carriers for frame in result.frames)
+        if total_bytes > max_bytes and total_bytes > 0:
+            ratio = max_bytes / total_bytes
+            for result in carriers:
+                self._thin(result, int(len(result.frames) * ratio))
+
+        # 3) 如实告知被砍了多少
+        for result, before in zip(carriers, original, strict=True):
+            dropped = before - len(result.frames)
+            if dropped <= 0:
+                continue
+            extra = (
+                f"因本轮图片预算限制，{before} 帧里只保留了 "
+                f"{len(result.frames)} 帧（沿时间轴均匀抽稀）"
+            )
+            result.notice = f"{result.notice}；{extra}" if result.notice else extra
+
+    @staticmethod
+    def _thin(result: MediaResult, keep: int) -> None:
+        """把某个媒体的帧数降到 keep，索引重新编号以便标签连续。"""
+        frames = result.frames
+        keep = max(0, min(keep, len(frames)))
+        if keep == len(frames):
+            return
+        picked = [frames[i] for i in thin_indices(len(frames), keep)]
+        result.frames = [
+            SampledFrame(f.path, position, f.timestamp, f.size_bytes)
+            for position, f in enumerate(picked)
+        ]

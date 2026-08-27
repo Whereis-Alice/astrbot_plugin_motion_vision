@@ -232,8 +232,9 @@ class FfmpegRunner:
                 args += ["-t", f"{window.length:.3f}"]
 
             filters = scale
-            if window.count > 1 and window.length:
-                fps = window.count / window.length
+            if window.count > 1 and window.step > 0:
+                # step 由窗口自己算：时长已知时是 length/count，未知时是兜底间隔。
+                fps = 1.0 / window.step
                 filters = f"fps={fps:.6f},{scale}"
             args += [
                 "-vf",

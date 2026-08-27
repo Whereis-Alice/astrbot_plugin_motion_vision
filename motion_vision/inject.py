@@ -32,6 +32,9 @@ FALLBACK_PROMPT = "请看看这段内容里发生了什么。"
 
 MAX_STAMPS_SHOWN = 12
 
+COARSE_INTERVAL_SECONDS = 10.0
+"""平均间隔超过这个值就明确提醒模型「中间的过程没看到」。"""
+
 
 @dataclass
 class InjectionReport:
@@ -126,6 +129,10 @@ def describe(result: MediaResult) -> str:
     if result.kind is MediaKind.ANIMATION and result.source_frame_count:
         pieces.append(f"源共 {result.source_frame_count} 帧")
     pieces.append(f"取样 {len(result.frames)} 帧")
+
+    density = _density(result)
+    if density:
+        pieces.append(density)
 
     stamps = _stamps(result.frames)
     if stamps:
@@ -307,6 +314,20 @@ def _seconds(value: float) -> str:
         minutes, rest = divmod(value, 60)
         return f"{int(minutes)} 分 {rest:.0f} 秒"
     return f"{value:.1f} 秒"
+
+
+def _density(result: MediaResult) -> str:
+    """说明这段内容被抽得有多稀，避免模型把「看过几帧」当成「看完全片」。"""
+    duration = result.duration or 0.0
+    count = len(result.frames)
+    if duration <= 0 or count <= 1:
+        return ""
+
+    interval = duration / count
+    text = f"平均每 {interval:.1f} 秒 1 帧"
+    if interval >= COARSE_INTERVAL_SECONDS:
+        text += "（间隔较大，两帧之间发生的事情没有被记录，不要凭空补全）"
+    return text
 
 
 def _stamps(frames: list[SampledFrame]) -> str:

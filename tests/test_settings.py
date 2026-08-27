@@ -15,7 +15,7 @@ def test_empty_config_falls_back_to_defaults():
     assert settings.video.max_videos_per_request == 2
     assert settings.audio.mode == "off"
     assert settings.injection.keep_frames_in_history is False
-    assert settings.advanced.max_images_per_request == 32
+    assert settings.advanced.max_images_per_request == 48
 
 
 def test_chinese_options_are_normalised():

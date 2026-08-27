@@ -5,6 +5,7 @@ from __future__ import annotations
 from motion_vision.sampling import (
     BURST_WINDOW_SECONDS,
     SINGLE_PASS_MAX_SECONDS,
+    UNKNOWN_DURATION_INTERVAL,
     ExtractionWindow,
     animation_frame_budget,
     audio_clip_seconds,
@@ -53,12 +54,48 @@ def test_animation_override_wins():
     assert animation_frame_budget(40, 0, preset, override=9) == 9
 
 
-def test_video_budget_grows_for_long_videos():
+def test_video_budget_follows_target_interval():
     preset = DETAIL_PRESETS["balanced"]
-    assert video_frame_budget(10.0, preset) == preset.video_frames
-    assert video_frame_budget(600.0, preset) == preset.long_video_frames
-    assert video_frame_budget(None, preset) == preset.video_frames
+    # 60 秒 / 目标 3 秒一帧 = 20 帧，落在上下限之间时严格按密度给
+    assert video_frame_budget(60.0, preset) == 20
+    # 极短片段不会低于下限
+    assert video_frame_budget(3.0, preset) == preset.min_video_frames
+    # 超长片段封顶在上限
+    assert video_frame_budget(36000.0, preset) == preset.max_video_frames
     assert video_frame_budget(600.0, preset, override=4) == 4
+
+
+def test_video_budget_is_monotonic_in_duration():
+    for preset in DETAIL_PRESETS.values():
+        budgets = [video_frame_budget(d, preset) for d in (5, 20, 60, 180, 600, 3600, 7200)]
+        assert budgets == sorted(budgets)
+        assert budgets[0] >= preset.min_video_frames
+        assert budgets[-1] <= preset.max_video_frames
+
+
+def test_one_minute_video_is_denser_on_higher_detail():
+    frugal = video_frame_budget(60.0, DETAIL_PRESETS["frugal"])
+    balanced = video_frame_budget(60.0, DETAIL_PRESETS["balanced"])
+    detailed = video_frame_budget(60.0, DETAIL_PRESETS["detailed"])
+    assert frugal < balanced < detailed
+    # 「精细」档对 1 分钟视频至少要做到 2 秒 1 帧
+    assert detailed >= 30
+
+
+def test_unknown_duration_falls_back_to_a_fixed_interval():
+    window = ExtractionWindow(0.0, None, 6)
+    assert window.step == UNKNOWN_DURATION_INTERVAL
+    # 时间戳必须真的铺开，而不是全部堆在 0 秒
+    assert window.timestamps() == [0.0, 2.0, 4.0, 6.0, 8.0, 10.0]
+
+
+def test_very_long_videos_prefer_more_sampling_points():
+    duration = 7200.0
+    budget = 24
+    windows = plan_extraction(duration, budget)
+    assert sum(w.count for w in windows) == budget
+    # 每窗口 2 帧 -> 12 个采样点，比每窗口 3 帧的 8 个点覆盖更广
+    assert len(windows) >= 12
 
 
 def test_distribute_spreads_remainder_to_the_front():
@@ -110,7 +147,7 @@ def test_window_timestamps_stay_inside_the_window():
     assert len(stamps) == 5
     assert stamps[0] == 10.0
     assert all(10.0 <= value < 15.0 for value in stamps)
-    assert ExtractionWindow(0.0, None, 3).timestamps() == [0.0]
+    assert ExtractionWindow(0.0, None, 3).timestamps() == [0.0, 2.0, 4.0]
     assert ExtractionWindow(0.0, 5.0, 0).timestamps() == []
 
 

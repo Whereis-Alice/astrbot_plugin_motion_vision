@@ -10,9 +10,10 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
-from .settings import HARD_MAX_FRAMES_PER_MEDIA, LONG_VIDEO_SECONDS, MB, DetailPreset
+from .settings import HARD_MAX_FRAMES_PER_MEDIA, MB, DetailPreset
 
 SINGLE_PASS_MAX_SECONDS = 120.0
 """不超过这个时长就整片顺序解码一次取帧。"""
@@ -23,6 +24,12 @@ BURST_WINDOW_SECONDS = 5.0
 FRAMES_PER_BURST = 3
 """长视频每个采样窗口期望的帧数。"""
 
+COVERAGE_FIRST_SECONDS = 900.0
+"""超过这个时长时优先铺开覆盖范围：每个窗口少给一帧、换更多的窗口。"""
+
+UNKNOWN_DURATION_INTERVAL = 2.0
+"""时长探测失败时的兜底采样间隔（秒）。"""
+
 MIN_ANIMATION_FRAMES = 2
 
 
@@ -30,20 +37,29 @@ MIN_ANIMATION_FRAMES = 2
 class ExtractionWindow:
     """一次 ffmpeg 调用要覆盖的时间窗口。
 
-    length 为 None 表示「一直到文件结尾」（时长未知时使用）。
+    length 为 None 表示「一直到文件结尾」（时长探测失败时使用）；这种情况下
+    退回固定的 UNKNOWN_DURATION_INTERVAL 间隔，而不是让 ffmpeg 连续输出
+    原生帧——那样抽出来的几张图几乎一模一样，等于白花钱。
     """
 
     start: float
     length: float | None
     count: int
 
+    @property
+    def step(self) -> float:
+        """相邻两帧的时间间隔（秒）。"""
+        if self.count <= 0:
+            return 0.0
+        if self.length is None or self.length <= 0:
+            return UNKNOWN_DURATION_INTERVAL
+        return self.length / self.count
+
     def timestamps(self) -> list[float]:
         """窗口内实际会落在哪些时间点（与 fps 滤镜的行为一致）。"""
         if self.count <= 0:
             return []
-        if self.length is None or self.length <= 0:
-            return [self.start]
-        step = self.length / self.count
+        step = self.step
         return [self.start + step * i for i in range(self.count)]
 
 
@@ -87,12 +103,28 @@ def animation_frame_budget(
 
 
 def video_frame_budget(duration: float | None, preset: DetailPreset, override: int = 0) -> int:
-    """决定一个视频抽多少帧。长视频给更多帧，因为时间跨度更大。"""
+    """决定一个视频抽多少帧：按目标采样间隔随时长增长，再夹进上下限。
+
+    这样 10 秒的短片和 10 分钟的长片不会拿到同一个帧数，也不会因为「长视频」
+    这一个笼统的档位，让 1 分钟和 2 小时的视频得到完全一样的待遇。
+    """
     if override > 0:
         return min(override, HARD_MAX_FRAMES_PER_MEDIA)
-    if duration is not None and duration > LONG_VIDEO_SECONDS:
-        return min(preset.long_video_frames, HARD_MAX_FRAMES_PER_MEDIA)
-    return min(preset.video_frames, HARD_MAX_FRAMES_PER_MEDIA)
+
+    ceiling = min(preset.max_video_frames, HARD_MAX_FRAMES_PER_MEDIA)
+    floor = min(preset.min_video_frames, ceiling)
+
+    if duration is None or duration <= 0:
+        # 时长未知，按兜底间隔估一个中等规模，别一上来就顶到上限。
+        return max(floor, min(ceiling, floor * 2))
+
+    wanted = math.ceil(duration / max(preset.seconds_per_frame, 0.1))
+    return max(floor, min(wanted, ceiling))
+
+
+def frames_per_burst(duration: float) -> int:
+    """很长的片子改成每个窗口 2 帧，用同样的帧数换更多的采样位置。"""
+    return 2 if duration > COVERAGE_FIRST_SECONDS else FRAMES_PER_BURST
 
 
 def distribute(total: int, buckets: int) -> list[int]:
@@ -114,7 +146,8 @@ def plan_extraction(duration: float | None, frame_budget: int) -> list[Extractio
     if duration <= SINGLE_PASS_MAX_SECONDS or count <= 2:
         return [ExtractionWindow(0.0, duration, count)]
 
-    bursts = max(2, min(count, round(count / FRAMES_PER_BURST)))
+    per_burst = frames_per_burst(duration)
+    bursts = max(2, min(count, round(count / per_burst)))
     counts = [c for c in distribute(count, bursts) if c > 0]
     bursts = len(counts)
     window = min(BURST_WINDOW_SECONDS, duration / bursts)
@@ -124,6 +157,39 @@ def plan_extraction(duration: float | None, frame_budget: int) -> list[Extractio
     return [
         ExtractionWindow(round(step * i, 3), round(window, 3), counts[i]) for i in range(bursts)
     ]
+
+
+def fair_allocation(wants: list[int], total: int) -> list[int]:
+    """把 total 个名额分给若干需求，谁也不会被前面的媒体饿死。
+
+    做法是注水式均分：每轮把剩余名额平均分给还没吃饱的需求，吃饱的退出，
+    直到名额用尽。这样第一个视频不会一口气吃掉整轮预算。
+    """
+    granted = [0] * len(wants)
+    remaining = max(0, total)
+    active = [i for i, want in enumerate(wants) if want > 0]
+
+    while remaining > 0 and active:
+        share, extra = divmod(remaining, len(active))
+        if share == 0:
+            for i in active[:extra]:
+                granted[i] += 1
+            break
+        for i in list(active):
+            take = min(share, wants[i] - granted[i])
+            granted[i] += take
+            remaining -= take
+            if granted[i] >= wants[i]:
+                active.remove(i)
+
+    return granted
+
+
+def thin_indices(total: int, keep: int) -> list[int]:
+    """要砍帧时均匀地砍，而不是把片尾整段丢掉。"""
+    if keep <= 0:
+        return []
+    return sample_indices(total, keep)
 
 
 def audio_clip_seconds(duration: float | None, limit: float = 600.0) -> float:
