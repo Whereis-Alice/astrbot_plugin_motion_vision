@@ -10,6 +10,9 @@
 
 默认所有新增内容都标记为临时（`mark_as_temp`），只对本轮生效、不写进
 对话历史；这样长对话不会被几十张帧撑爆。
+
+唯一的例外是 `memo`：那是一行几十个字的媒体档案，会留在历史里，
+好让模型日后知道「这里曾经有过一个视频，还能再看一次」。
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ import contextlib
 from dataclasses import dataclass
 from typing import Any
 
-from .models import MediaKind, MediaResult, SampledFrame
+from .models import MediaKind, MediaResult, SampledFrame, format_duration
 from .settings import Settings
 
 HEADER = (
@@ -45,6 +48,7 @@ class InjectionReport:
     audio: int = 0
     transcripts: int = 0
     notices: int = 0
+    memo: bool = False
 
     @property
     def touched(self) -> bool:
@@ -57,8 +61,16 @@ class InjectionReport:
         )
 
 
-def inject(request: Any, results: list[MediaResult], settings: Settings) -> InjectionReport:
-    """把 MediaResult 列表写进 ProviderRequest，返回统计。"""
+def inject(
+    request: Any,
+    results: list[MediaResult],
+    settings: Settings,
+    memo: str = "",
+) -> InjectionReport:
+    """把 MediaResult 列表写进 ProviderRequest，返回统计。
+
+    memo 是一行会写进对话历史的媒体档案（可留空），其余内容默认只在当轮可见。
+    """
     report = InjectionReport()
     usable = [result for result in results if result.ok]
     notices = [result for result in results if result.notice] if _notices_on(settings) else []
@@ -106,6 +118,11 @@ def inject(request: Any, results: list[MediaResult], settings: Settings) -> Inje
     if guidance and usable:
         add(_text(guidance))
 
+    if memo and usable:
+        # 单独一个 appender：这条不打临时标记，才能留在历史里。
+        _appender(parts, temporary=False)(_text(memo))
+        report.memo = True
+
     if not _prompt(request):
         _set_prompt(request, FALLBACK_PROMPT)
 
@@ -125,7 +142,7 @@ def describe(result: MediaResult) -> str:
     pieces: list[str] = []
 
     if result.duration and result.duration > 0:
-        pieces.append(f"时长约 {_seconds(result.duration)}")
+        pieces.append(f"时长约 {format_duration(result.duration)}")
     if result.kind is MediaKind.ANIMATION and result.source_frame_count:
         pieces.append(f"源共 {result.source_frame_count} 帧")
     pieces.append(f"取样 {len(result.frames)} 帧")
@@ -307,13 +324,6 @@ def _frame_id(frame: SampledFrame, result: MediaResult) -> str:
 
 def _notices_on(settings: Settings) -> bool:
     return settings.injection.notice_enabled
-
-
-def _seconds(value: float) -> str:
-    if value >= 60:
-        minutes, rest = divmod(value, 60)
-        return f"{int(minutes)} 分 {rest:.0f} 秒"
-    return f"{value:.1f} 秒"
 
 
 def _density(result: MediaResult) -> str:

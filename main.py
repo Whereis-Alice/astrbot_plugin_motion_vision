@@ -18,13 +18,28 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
+from .motion_vision.animation import guess_suffix
 from .motion_vision.cache import ResultCache
-from .motion_vision.ffmpeg import FfmpegRunner, FfmpegTools, discover_tools
+from .motion_vision.ffmpeg import (
+    FFMPEG_INSTALL_HINT,
+    FfmpegRunner,
+    FfmpegTools,
+    discover_tools,
+)
 from .motion_vision.inject import inject
 from .motion_vision.models import MediaItem, MediaKind, MediaResult
 from .motion_vision.pipeline import MediaPipeline
-from .motion_vision.settings import AUDIO_LABELS, DETAIL_LABELS, Settings, load_settings
+from .motion_vision.registry import MediaRecord, MediaRegistry, build_memo
+from .motion_vision.review import build_payload, make_span, tune_settings
+from .motion_vision.settings import (
+    AUDIO_LABELS,
+    DETAIL_LABELS,
+    MB,
+    Settings,
+    load_settings,
+)
 from .motion_vision.sources.animation import resolve_animations
+from .motion_vision.sources.common import download_to_file
 from .motion_vision.sources.video import VideoCollector
 from .motion_vision.stt import describe_backend
 from .motion_vision.tempstore import TempStore
@@ -39,12 +54,15 @@ DOWNLOAD_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
 
 EMPTY_MESSAGE_FALLBACK = "请看看我发的这段内容里有什么。"
 
+REVIEW_TOOL_NAME = "review_motion_media"
+"""回看工具的名字。要同时出现在工具注册、备忘文案和启停开关里，所以抽成常量。"""
+
 
 @register(
     PLUGIN_NAME,
     "Whereis-Alice",
     "让大模型读懂动图和视频：自动抽取关键帧、可选提取语音，再连同说明一起交给模型。",
-    "0.3.0",
+    "0.4.0",
     "https://github.com/Whereis-Alice/astrbot_plugin_motion_vision",
 )
 class MotionVisionPlugin(Star):
@@ -58,6 +76,7 @@ class MotionVisionPlugin(Star):
             self.settings.advanced.temp_retention_hours * 3600,
         )
         self.cache = ResultCache(on_evict=TempStore.discard)
+        self.registry = MediaRegistry(on_discard=TempStore.discard)
         self.client = httpx.AsyncClient(
             timeout=DOWNLOAD_TIMEOUT,
             follow_redirects=True,
@@ -69,10 +88,15 @@ class MotionVisionPlugin(Star):
         self._tools_key = self.settings.advanced.ffmpeg_path
         self.runner = FfmpegRunner(self._tools)
 
+        self._review_active: bool | None = None
+        self._sync_review_tool(self.settings.review.enabled)
+
         logger.info(
             f"{LOG_TAG} 已加载：细节档位 {self.settings.detail_level}，"
             f"ffmpeg {self._tools.source or '未找到'}"
         )
+        if self.settings.video.enabled and not self._tools.available:
+            logger.warning(f"{LOG_TAG} {FFMPEG_INSTALL_HINT}")
 
     # --- 钩子 ---------------------------------------------------------------
 
@@ -123,7 +147,20 @@ class MotionVisionPlugin(Star):
         if not items and not notices:
             return
 
-        pipeline = MediaPipeline(
+        results: list[MediaResult] = await self._pipeline(settings).run(items) if items else []
+        results.extend(
+            MediaResult(item=MediaItem(MediaKind.VIDEO, name, name, None), notice=reason)
+            for name, reason in notices
+        )
+
+        memo = self._bookkeep(event, results, settings)
+        report = inject(req, results, settings, memo=memo)
+        if report.touched:
+            logger.info(f"{LOG_TAG} 已注入 {report}")
+
+    def _pipeline(self, settings: Settings) -> MediaPipeline:
+        """流水线是无状态的，每次按当前配置现搭一个，热更新才能立刻生效。"""
+        return MediaPipeline(
             settings=settings,
             runner=self.runner,
             store=self.store,
@@ -132,17 +169,6 @@ class MotionVisionPlugin(Star):
             context=self.context,
             log=logger,
         )
-        results: list[MediaResult] = await pipeline.run(items) if items else []
-        results.extend(
-            MediaResult(item=MediaItem(MediaKind.VIDEO, name, name, None), notice=reason)
-            for name, reason in notices
-        )
-
-        report = inject(req, results, settings)
-        if report.touched:
-            logger.info(f"{LOG_TAG} 已注入 {report}")
-
-        self._discard_owned(results)
 
     # --- 来源收集 -----------------------------------------------------------
 
@@ -201,13 +227,190 @@ class MotionVisionPlugin(Star):
                 seen.append(candidate)
         return tuple(seen)
 
-    def _discard_owned(self, results: list[MediaResult]) -> None:
-        """插件自己下载的原始视频在抽完帧后就没用了，立刻删掉省磁盘。"""
+    # --- 媒体档案 -----------------------------------------------------------
+
+    def _bookkeep(
+        self, event: AstrMessageEvent, results: list[MediaResult], settings: Settings
+    ) -> str:
+        """登记本轮媒体，并决定源文件是立刻删还是留着等回看。
+
+        回看关闭时行为和以前一样：抽完帧，插件自己下载的原始文件立刻删掉。
+        开启时把它交给 TempStore 按保留时长回收，这段时间内模型可以要求再看一次。
+        """
+        if not settings.review.enabled:
+            for result in results:
+                self._release(result)
+            return ""
+
+        session = self._session(event)
+        records: list[MediaRecord] = []
         for result in results:
-            item = result.item
-            if item.owned_temp and item.path is not None:
-                TempStore.discard(item.path)
-                item.path = None
+            record = self._remember(session, result) if result.ok else None
+            if record is None:
+                self._release(result)
+                continue
+            records.append(record)
+        return build_memo(records, REVIEW_TOOL_NAME)
+
+    @staticmethod
+    def _release(result: MediaResult) -> None:
+        """删掉插件自己下载的原始文件（抽完帧它就没用了）。"""
+        item = result.item
+        if item.owned_temp and item.path is not None:
+            TempStore.discard(item.path)
+            item.path = None
+
+    def _remember(self, session: str, result: MediaResult) -> MediaRecord | None:
+        """把一条处理成功的媒体登记进档案；登记不了就返回 None（调用方会删文件）。"""
+        item = result.item
+        path = item.path
+        spilled = False
+        if path is None and item.data is not None:
+            # 内联 base64 动图本来没有文件，想以后还能看就得先落盘。
+            path = self._spill(item.data)
+            spilled = path is not None
+        if path is None and not item.source_url:
+            return None
+
+        try:
+            return self.registry.remember(
+                session,
+                item.kind,
+                item.display_name,
+                path=path,
+                source_url=item.source_url,
+                duration=result.duration,
+                frames_seen=len(result.frames),
+                owned_temp=item.owned_temp or spilled,
+            )
+        except Exception as exc:
+            logger.debug(f"{LOG_TAG} 登记媒体失败: {exc}")
+            return None
+
+    def _spill(self, data: bytes) -> Path | None:
+        """把内联字节写进临时目录，让它也具备被回看的资格。"""
+        try:
+            target = self.store.download_path(guess_suffix(data[:1024]))
+            target.write_bytes(data)
+            return target
+        except OSError as exc:
+            logger.debug(f"{LOG_TAG} 内联媒体落盘失败: {exc}")
+            return None
+
+    @staticmethod
+    def _session(event: AstrMessageEvent) -> str:
+        try:
+            return event.unified_msg_origin or ""
+        except Exception:
+            return ""
+
+    # --- 回看工具 -----------------------------------------------------------
+
+    def _sync_review_tool(self, enabled: bool) -> None:
+        """按配置启停回看工具。
+
+        关掉时要真的从工具表里摘掉，否则模型看得见却调不通，只会白白浪费一轮。
+        只有切换成功才记住状态，失败留待下一轮重试。
+        """
+        if self._review_active is enabled:
+            return
+        try:
+            if enabled:
+                done = self.context.activate_llm_tool(REVIEW_TOOL_NAME)
+            else:
+                done = self.context.deactivate_llm_tool(REVIEW_TOOL_NAME)
+        except Exception as exc:
+            logger.debug(f"{LOG_TAG} 切换回看工具失败: {exc}")
+            return
+        if done:
+            self._review_active = enabled
+
+    @filter.llm_tool(name=REVIEW_TOOL_NAME)
+    async def review_motion_media(
+        self,
+        event: AstrMessageEvent,
+        media_id: str = "",
+        frames: int = 0,
+        start_seconds: float = 0.0,
+        end_seconds: float = 0.0,
+    ):
+        """重新查看这个会话里出现过的动图或视频，可以要求更多帧或只看视频的某一段。
+
+        画面默认只在出现的那一轮可见，之后就从上下文里撤掉了。当你需要再看一次、
+        想看得更细，或者要确认某个时间点到底发生了什么，就调用这个工具。
+
+        Args:
+            media_id(string): 媒体编号，取自对话里的「编号 xxxx」。留空表示最近出现的那一个。
+            frames(number): 希望看到多少帧，最多 32。留 0 表示按插件当前档位自动决定。
+            start_seconds(number): 只看某一段时的起始秒数，0 表示从片头开始。仅对视频有效。
+            end_seconds(number): 只看某一段时的结束秒数，0 表示一直看到结尾。仅对视频有效。
+        """
+        settings = self._refresh()
+        if not settings.review.enabled:
+            return "回看功能当前是关闭的，没法重新调取画面。"
+
+        session = self._session(event)
+        record = self.registry.find(session, media_id)
+        if record is None:
+            return self._review_miss(session)
+        if not record.readable:
+            return f"《{record.display_name}》的源文件已经清理掉了，没法再看一次。"
+
+        path = await self._ensure_file(record)
+        if path is None:
+            return f"《{record.display_name}》的源文件已经取不回来了，没法再看一次。"
+
+        span = make_span(record.kind, start_seconds, end_seconds)
+        item = MediaItem(
+            kind=record.kind,
+            name=record.display_name,
+            identity=f"review:{record.token}",
+            path=path,
+        )
+        async with self._gate:
+            results = await self._pipeline(tune_settings(settings, frames)).run([item], span=span)
+
+        result = results[0]
+        if not result.frames:
+            return result.notice or f"《{record.display_name}》这次没能取到画面。"
+
+        record.reviews += 1
+        record.frames_seen = max(record.frames_seen, len(result.frames))
+        logger.info(f"{LOG_TAG} 回看 {record.token}：{len(result.frames)} 帧")
+        return await asyncio.to_thread(
+            build_payload, record.display_name, record.token, result, span
+        )
+
+    async def _ensure_file(self, record: MediaRecord) -> Path | None:
+        """确保源文件在本地。临时文件被清理过的话，用原地址重新下一次。"""
+        if record.has_file:
+            return record.path
+        if not record.source_url:
+            return None
+
+        target = self.store.download_path(Path(record.display_name).suffix or ".bin")
+        try:
+            await download_to_file(
+                self.client,
+                record.source_url,
+                target,
+                self.settings.video.max_download_mb * MB,
+            )
+        except Exception as exc:
+            logger.debug(f"{LOG_TAG} 重新取回 {record.token} 失败: {exc}")
+            TempStore.discard(target)
+            return None
+
+        record.path = target
+        record.owned_temp = True
+        return target
+
+    def _review_miss(self, session: str) -> str:
+        records = self.registry.records(session)
+        if not records:
+            return "这个会话里还没有登记过可以回看的动图或视频。"
+        listing = "\n".join(f"- {record.summary()}" for record in records)
+        return "没有找到这个编号。当前可以回看的是：\n" + listing
 
     # --- 配置热更新 ---------------------------------------------------------
 
@@ -223,6 +426,7 @@ class MotionVisionPlugin(Star):
             self.runner = FfmpegRunner(self._tools)
             logger.info(f"{LOG_TAG} ffmpeg 路径已更新：{self._tools.source or '未找到'}")
 
+        self._sync_review_tool(settings.review.enabled)
         return settings
 
     # --- 指令 ---------------------------------------------------------------
@@ -255,24 +459,33 @@ class MotionVisionPlugin(Star):
             f"ffmpeg：{ffmpeg_state}",
             f"音频模式：{AUDIO_LABELS.get(settings.audio.mode, settings.audio.mode)}",
             f"语音转写：{describe_backend(self.context, settings.audio)}",
+            f"回看：{'开' if settings.review.enabled else '关'}"
+            f"，已登记 {len(self.registry)} 条媒体",
             f"结果缓存：{len(self.cache)} 条",
             f"临时文件：{files} 个 / {total_bytes / 1048576:.1f} MB",
         ]
+        if settings.video.enabled and not self._tools.available:
+            lines.append("")
+            lines.append(FFMPEG_INSTALL_HINT)
         yield event.plain_result("\n".join(lines))
 
     @motionvision.command("clear", alias={"清理"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def clear(self, event: AstrMessageEvent):
-        """清空结果缓存和临时文件。"""
+        """清空结果缓存、媒体档案和临时文件。"""
         self.cache.clear()
+        forgotten = self.registry.clear()
         removed = self.store.sweep(min_interval=0.0)
         TempStore.discard(self.store.base)
-        yield event.plain_result(f"已清空结果缓存，并清理了 {removed} 项临时文件。")
+        yield event.plain_result(
+            f"已清空结果缓存与 {forgotten} 条媒体档案，并清理了 {removed} 项临时文件。"
+        )
 
     # --- 生命周期 -----------------------------------------------------------
 
     async def terminate(self) -> None:
         self.cache.clear()
+        self.registry.clear()
         with contextlib.suppress(Exception):
             await self.client.aclose()
         logger.info(f"{LOG_TAG} 已卸载")

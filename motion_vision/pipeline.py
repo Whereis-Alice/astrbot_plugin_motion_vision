@@ -13,7 +13,7 @@ from typing import Any
 from .animation import AnimationError, sample_animation
 from .cache import CacheEntry, ResultCache, fingerprint
 from .ffmpeg import FfmpegError, FfmpegRunner
-from .models import MediaItem, MediaKind, MediaResult, SampledFrame
+from .models import MediaItem, MediaKind, MediaResult, SampledFrame, TimeSpan
 from .sampling import (
     animation_frame_budget,
     audio_clip_seconds,
@@ -25,6 +25,19 @@ from .sampling import (
 from .settings import MB, Settings
 from .stt import SttError, transcribe
 from .tempstore import TempStore
+
+
+def _span_length(duration: float | None, span: TimeSpan | None) -> float | None:
+    """算出实际要采样的时长：整片时就是片长，只看一段时是那一段的长度。"""
+    if span is None or not span.active:
+        return duration
+    end = span.end
+    if duration is not None and duration > 0:
+        end = duration if end is None else min(end, duration)
+    if end is None:
+        return None
+    length = end - max(0.0, span.start)
+    return length if length > 0 else duration
 
 
 class MediaPipeline:
@@ -48,11 +61,12 @@ class MediaPipeline:
 
     # --- 入口 ---------------------------------------------------------------
 
-    async def run(self, items: list[MediaItem]) -> list[MediaResult]:
+    async def run(self, items: list[MediaItem], span: TimeSpan | None = None) -> list[MediaResult]:
+        """处理一批媒体。span 只在「回看某一段」时给出，平时是整片。"""
         results: list[MediaResult] = []
         for item in items:
             try:
-                results.append(await self._process(item))
+                results.append(await self._process(item, span))
             except Exception as exc:  # 任何单个媒体的失败都不该影响整轮对话
                 self.log.warning(f"[MotionVision] 处理 {item.display_name} 时出错: {exc}")
                 results.append(MediaResult(item=item, notice="处理时发生未预期的错误"))
@@ -61,8 +75,13 @@ class MediaPipeline:
 
     # --- 单个媒体 -----------------------------------------------------------
 
-    async def _process(self, item: MediaItem) -> MediaResult:
-        key = fingerprint(item.path, item.data, self.settings.cache_signature)
+    async def _process(self, item: MediaItem, span: TimeSpan | None = None) -> MediaResult:
+        window = span if span is not None and span.active else None
+        signature = self.settings.cache_signature
+        if window is not None:
+            signature = f"{signature}@{window.key}"
+
+        key = fingerprint(item.path, item.data, signature)
         cached = self.cache.get(key)
         if cached is not None:
             return MediaResult(
@@ -76,8 +95,11 @@ class MediaPipeline:
 
         if item.kind is MediaKind.ANIMATION:
             result, entry = await self._process_animation(item)
+            if window is not None and result.frames:
+                # 动图整体就那么几十帧，按时间段裁反而更容易漏掉关键动作。
+                result.notice = "动图不支持只看某一段，这里是整段重新取样的结果"
         else:
-            result, entry = await self._process_video(item)
+            result, entry = await self._process_video(item, window)
 
         if entry is not None:
             self.cache.put(key, entry)
@@ -122,7 +144,9 @@ class MediaPipeline:
         )
         return (result, entry)
 
-    async def _process_video(self, item: MediaItem) -> tuple[MediaResult, CacheEntry | None]:
+    async def _process_video(
+        self, item: MediaItem, span: TimeSpan | None = None
+    ) -> tuple[MediaResult, CacheEntry | None]:
         if item.path is None:
             return (MediaResult(item=item, notice="找不到视频文件"), None)
         if not self.runner.available:
@@ -153,8 +177,15 @@ class MediaPipeline:
         notice = ""
 
         if probe.has_video and remaining() > 5:
-            budget = video_frame_budget(probe.duration, preset, self.settings.video_frames_override)
-            windows = plan_extraction(probe.duration, budget)
+            # 只看一段时，帧数按这一段的长度算——否则 10 秒的片段会拿到整片的预算。
+            scope = _span_length(probe.duration, span)
+            budget = video_frame_budget(scope, preset, self.settings.video_frames_override)
+            windows = plan_extraction(
+                probe.duration,
+                budget,
+                start=span.start if span is not None else 0.0,
+                end=span.end if span is not None else None,
+            )
             try:
                 frames = await self.runner.extract_frames(
                     item.path,

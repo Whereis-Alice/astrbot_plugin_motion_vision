@@ -129,6 +129,12 @@ class InjectionSettings:
 
 
 @dataclass(frozen=True)
+class ReviewSettings:
+    enabled: bool = True
+    """允许模型主动回看之前出现过的动图/视频。"""
+
+
+@dataclass(frozen=True)
 class AdvancedSettings:
     ffmpeg_path: str = ""
     max_images_per_request: int = 48
@@ -148,6 +154,7 @@ class Settings:
     video: VideoSettings = field(default_factory=VideoSettings)
     audio: AudioSettings = field(default_factory=AudioSettings)
     injection: InjectionSettings = field(default_factory=InjectionSettings)
+    review: ReviewSettings = field(default_factory=ReviewSettings)
     advanced: AdvancedSettings = field(default_factory=AdvancedSettings)
 
     @property
@@ -225,6 +232,7 @@ def load_settings(config: Any) -> Settings:
     video = _section(raw, "video")
     audio = _section(raw, "audio")
     injection = _section(raw, "injection")
+    review = _section(raw, "review")
     advanced = _section(raw, "advanced")
 
     # 0.2.x 只有一个共用的 frames_override，升级上来时沿用它当两边的初值。
@@ -271,6 +279,9 @@ def load_settings(config: Any) -> Settings:
             notice_enabled=_as_bool(injection.get("notice_enabled"), True),
             keep_frames_in_history=_as_bool(injection.get("keep_frames_in_history"), False),
             extra_guidance=_as_str(injection.get("extra_guidance")),
+        ),
+        review=ReviewSettings(
+            enabled=_as_bool(review.get("enabled"), True),
         ),
         advanced=AdvancedSettings(
             ffmpeg_path=_as_str(advanced.get("ffmpeg_path")),

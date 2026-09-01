@@ -175,6 +175,7 @@ async def resolve_animations(
                 part_index=candidate.part_index,
                 marker_raw=candidate.marker_raw,
                 quoted=candidate.quoted,
+                source_url=candidate.raw if is_http_url(candidate.raw) else "",
             )
         )
 

@@ -216,3 +216,22 @@ def test_extra_guidance_is_appended(tmp_path: Path) -> None:
     inject(request, [_result(tmp_path, frames=1)], _settings(extra_guidance="请用中文吐槽一句"))
 
     assert "请用中文吐槽一句" in _texts(request)
+
+
+def test_memo_is_the_only_thing_that_stays_in_history(tmp_path: Path) -> None:
+    request = FakeRequest()
+    report = inject(request, [_result(tmp_path, frames=2)], _settings(), memo="【档案】编号 a3f1")
+
+    assert report.memo is True
+    kept = [part for part in request.extra_user_content_parts if not part._no_save]
+    assert [part.text for part in kept] == ["【档案】编号 a3f1"]
+
+
+def test_memo_is_skipped_when_nothing_was_readable() -> None:
+    item = MediaItem(kind=MediaKind.VIDEO, name="big.mp4", identity="id-3")
+    request = FakeRequest()
+
+    report = inject(request, [MediaResult(item=item, notice="太大")], _settings(), memo="【档案】x")
+
+    assert report.memo is False
+    assert "【档案】x" not in _texts(request)

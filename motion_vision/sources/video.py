@@ -268,7 +268,7 @@ class VideoCollector:
 
         component_path, component_url = await self._ask_component(candidate)
         if component_path is not None:
-            return self._make_item(candidate, component_path, owned=False)
+            return self._make_item(candidate, component_path, owned=False, url=component_url)
 
         url = candidate.url or component_url
         if not url and candidate.file_id and self.include_group_files:
@@ -288,7 +288,7 @@ class VideoCollector:
             result.notices.append((label, f"下载失败（{redact_url(url)}）"))
             return None
 
-        return self._make_item(candidate, dest, owned=True)
+        return self._make_item(candidate, dest, owned=True, url=url)
 
     async def _ask_component(self, candidate: VideoCandidate) -> tuple[Path | None, str]:
         """交给组件自己的 get_file / convert_to_file_path 去落盘。
@@ -402,7 +402,9 @@ class VideoCollector:
     def _remember(self, candidate: VideoCandidate) -> None:
         self._seen.update(candidate.identity_keys())
 
-    def _make_item(self, candidate: VideoCandidate, path: Path, owned: bool) -> MediaItem:
+    def _make_item(
+        self, candidate: VideoCandidate, path: Path, owned: bool, url: str = ""
+    ) -> MediaItem:
         identity = f"path:{str(path).casefold()}"
         self._seen.add(identity)
         return MediaItem(
@@ -414,6 +416,7 @@ class VideoCollector:
             marker_raw=candidate.marker_raw,
             quoted=candidate.quoted,
             owned_temp=owned,
+            source_url=url or candidate.url,
         )
 
 

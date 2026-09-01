@@ -191,3 +191,32 @@ def test_audio_clip_is_capped():
     assert audio_clip_seconds(12.0) == 12.0
     assert audio_clip_seconds(9999.0) == 600.0
     assert audio_clip_seconds(None) == 600.0
+
+
+def test_plan_extraction_defaults_to_the_whole_clip():
+    assert plan_extraction(20.0, 6) == plan_extraction(20.0, 6, 0.0, None)
+
+
+def test_plan_extraction_honours_a_time_window():
+    windows = plan_extraction(600.0, 12, start=120.0, end=180.0)
+    assert windows
+    assert windows[0].start >= 120.0
+    last = windows[-1]
+    assert last.start + (last.length or 0.0) <= 180.0 + 1e-6
+    assert sum(window.count for window in windows) == 12
+
+
+def test_plan_extraction_scopes_a_short_window_to_one_pass():
+    windows = plan_extraction(600.0, 8, start=10.0, end=25.0)
+    assert windows == [ExtractionWindow(10.0, 15.0, 8)]
+
+
+def test_plan_extraction_falls_back_when_the_window_is_bogus():
+    whole = plan_extraction(60.0, 6)
+    assert plan_extraction(60.0, 6, start=40.0, end=10.0) == whole
+    assert plan_extraction(60.0, 6, start=999.0) == whole
+
+
+def test_plan_extraction_window_survives_unknown_duration():
+    assert plan_extraction(None, 5, start=30.0, end=45.0) == [ExtractionWindow(30.0, 15.0, 5)]
+    assert plan_extraction(None, 5, start=30.0) == [ExtractionWindow(30.0, None, 5)]

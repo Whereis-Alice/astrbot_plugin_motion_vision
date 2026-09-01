@@ -159,27 +159,44 @@ def distribute(total: int, buckets: int) -> list[int]:
     return [base + (1 if i < remainder else 0) for i in range(buckets)]
 
 
-def plan_extraction(duration: float | None, frame_budget: int) -> list[ExtractionWindow]:
-    """把「抽 N 帧」翻译成若干个 ffmpeg 抽帧窗口。"""
+def plan_extraction(
+    duration: float | None,
+    frame_budget: int,
+    start: float = 0.0,
+    end: float | None = None,
+) -> list[ExtractionWindow]:
+    """把「抽 N 帧」翻译成若干个 ffmpeg 抽帧窗口。
+
+    start / end 可以把采样限制在片中的某一段（回看某个时间区间时用到）。
+    默认整片，此时行为和只传时长完全一样。
+    """
     count = max(1, frame_budget)
+    begin = max(0.0, start)
 
     if duration is None or duration <= 0:
-        # 时长未知（探测失败）：整片走一遍，让 ffmpeg 自己决定能给多少帧。
-        return [ExtractionWindow(0.0, None, count)]
+        # 时长未知（探测失败）：从起点走到指定终点，让 ffmpeg 自己决定能给多少帧。
+        length = end - begin if end is not None and end > begin else None
+        return [ExtractionWindow(begin, length, count)]
 
-    if duration <= SINGLE_PASS_MAX_SECONDS or count <= 2:
-        return [ExtractionWindow(0.0, duration, count)]
+    finish = duration if end is None else min(end, duration)
+    if finish <= begin:  # 区间写反或超出片长，退回整片，别抽出个空
+        begin, finish = 0.0, duration
+    length = finish - begin
 
-    per_burst = frames_per_burst(duration)
+    if length <= SINGLE_PASS_MAX_SECONDS or count <= 2:
+        return [ExtractionWindow(round(begin, 3), round(length, 3), count)]
+
+    per_burst = frames_per_burst(length)
     bursts = max(2, min(count, round(count / per_burst)))
     counts = [c for c in distribute(count, bursts) if c > 0]
     bursts = len(counts)
-    window = min(BURST_WINDOW_SECONDS, duration / bursts)
-    span = max(0.0, duration - window)
+    window = min(BURST_WINDOW_SECONDS, length / bursts)
+    span = max(0.0, length - window)
     step = span / (bursts - 1) if bursts > 1 else 0.0
 
     return [
-        ExtractionWindow(round(step * i, 3), round(window, 3), counts[i]) for i in range(bursts)
+        ExtractionWindow(round(begin + step * i, 3), round(window, 3), counts[i])
+        for i in range(bursts)
     ]
 
 

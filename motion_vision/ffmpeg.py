@@ -26,6 +26,17 @@ MAX_CONCURRENT_JOBS = 2
 DURATION_PATTERN = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+FFMPEG_INSTALL_HINT = """视频功能需要 ffmpeg，当前没有找到。三种装法任选其一：
+
+1) 最省事：AstrBot WebUI -> 控制台 -> 安装 pip 库，填「imageio-ffmpeg」。
+   它自带一份 ffmpeg 二进制（约 80MB），装完重启 AstrBot 就能用。
+2) 装到系统里：Windows「winget install ffmpeg」、
+   Debian/Ubuntu「sudo apt install ffmpeg」、macOS「brew install ffmpeg」，装完重启 AstrBot。
+3) 已经装在别处：把 ffmpeg 所在目录（或可执行文件本身）填进插件配置的「高级 - ffmpeg 路径」。
+
+动图（GIF / 动态 WebP / APNG）不依赖 ffmpeg，不受影响。"""
+"""ffmpeg 缺失时给出的安装引导。日志和 /motionvision status 共用同一份文案。"""
+
 
 class FfmpegError(RuntimeError):
     """ffmpeg 相关失败，message 直接可以给用户/模型看。"""

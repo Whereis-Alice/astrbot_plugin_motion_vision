@@ -59,6 +59,12 @@ def detect_family(head: bytes) -> str | None:
     return None
 
 
+def guess_suffix(head: bytes) -> str:
+    """按文件头猜一个扩展名，供「把内联字节落盘」时使用。"""
+    family = detect_family(head)
+    return f".{family}" if family else ".img"
+
+
 def maybe_animated(head: bytes) -> bool:
     """在只有文件头时给出「值得进一步处理吗」的判断。
 
