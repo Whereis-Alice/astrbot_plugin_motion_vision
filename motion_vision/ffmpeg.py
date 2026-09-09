@@ -350,6 +350,60 @@ class FfmpegRunner:
             raise FfmpegError("音轨提取失败，这个视频可能没有声音")
         return AudioClip(path=out_path, seconds=seconds)
 
+    async def compress_video(
+        self,
+        path: Path,
+        out_path: Path,
+        *,
+        max_seconds: int = 120,
+        height: int = 720,
+        crf: int = 28,
+        timeout: float = 300.0,
+    ) -> Path:
+        """把视频压到适合原生视频接口上传的临时 MP4。
+
+        这是可选的降级路径，不参与普通抽帧。单独放在 Runner 里可以复用
+        同一套并发闸门、超时和子进程清理逻辑，避免压缩任务偷偷绕过资源限制。
+        """
+        if not self.tools.ffmpeg:
+            raise FfmpegError("ffmpeg 不可用，无法压缩视频")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        height = max(144, int(height))
+        crf = max(18, min(40, int(crf)))
+        args = [
+            self.tools.ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(path),
+        ]
+        if max_seconds > 0:
+            args += ["-t", f"{max_seconds:d}"]
+        args += [
+            "-vf",
+            f"scale=w='min(iw,{height})':h='min(ih,{height})':force_original_aspect_ratio=decrease",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            str(crf),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-movflags",
+            "+faststart",
+            str(out_path),
+        ]
+        result = await self._run(args, timeout)
+        if result.returncode != 0 or not out_path.exists() or _size_of(out_path) <= 0:
+            out_path.unlink(missing_ok=True)
+            raise FfmpegError(f"视频压缩失败：{_last_line(result.stderr)}")
+        return out_path
+
 
 def _parse_ffprobe(payload: str) -> ProbeResult | None:
     import json

@@ -22,6 +22,7 @@ class CacheEntry:
     duration: float | None = None
     source_frame_count: int | None = None
     transcript: str = ""
+    native_report: str = ""
     audio: AudioClip | None = None
     notice: str = ""
     frames_dir: Path | None = None

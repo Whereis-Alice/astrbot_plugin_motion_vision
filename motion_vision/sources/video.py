@@ -22,6 +22,7 @@ from typing import Any
 
 import httpx
 
+from ..cards import REMOTE_ATTEMPTED_ATTR, REMOTE_PAYLOADS_ATTR
 from ..models import MediaItem, MediaKind
 from .common import (
     MB,
@@ -117,7 +118,10 @@ class VideoCollector:
         candidates += self._from_raw_message()
         # 一条消息可以同时包含直接发送的视频和一个未展开的引用视频。不能因为
         # 前者已经找到，就跳过对后者的一次有界回查。
-        if not candidates or not any(candidate.quoted for candidate in candidates):
+        remote_lookup_done = bool(_event_value(self.event, REMOTE_ATTEMPTED_ATTR, False))
+        if (
+            not candidates or not any(candidate.quoted for candidate in candidates)
+        ) and not remote_lookup_done:
             candidates += await self._from_reply_lookup()
 
         for candidate in candidates:
@@ -176,10 +180,17 @@ class VideoCollector:
             if isinstance(component, AstrVideo):
                 if skip_video_components:
                     return
+                values = [
+                    str(getattr(component, name, "") or "") for name in ("path", "file", "url")
+                ]
+                url = next((value for value in values if is_http_url(value)), "")
+                raw = next((value for value in values if value and not is_http_url(value)), "")
+                source = url or raw
                 bucket.append(
                     VideoCandidate(
-                        name=Path(str(component.path or component.file or "video")).name,
-                        raw_path=str(component.path or component.file or ""),
+                        name=Path(source.split("?", 1)[0]).name or "video",
+                        raw_path=raw,
+                        url=url,
                         quoted=is_quoted,
                         origin="chain:video",
                         component=component,
@@ -187,13 +198,22 @@ class VideoCollector:
                 )
             elif isinstance(component, AstrFile):
                 name = str(getattr(component, "name", "") or "")
-                if not looks_like_video(name):
-                    return
-                raw = str(getattr(component, "file_", "") or "")
+                raw = str(
+                    getattr(component, "file_", "")
+                    or getattr(component, "file", "")
+                    or getattr(component, "path", "")
+                    or ""
+                )
                 url = str(getattr(component, "url", "") or "")
+                if (
+                    not looks_like_video(name, str(getattr(component, "mime", "") or ""))
+                    and not looks_like_video(raw)
+                    and not looks_like_video(url)
+                ):
+                    return
                 bucket.append(
                     VideoCandidate(
-                        name=name,
+                        name=name or Path((url or raw).split("?", 1)[0]).name or "视频",
                         raw_path="" if is_http_url(raw) else raw,
                         url=url if is_http_url(url) else "",
                         file_id=str(getattr(component, "file_id", "") or ""),
@@ -219,7 +239,22 @@ class VideoCollector:
         if raw is None:
             raw = getattr(self.event, "raw_message", None)
         segments = _raw_segments(raw)
-        return [c for c in (self._candidate_from_segment(s) for s in segments) if c]
+        remote_payloads = _event_value(self.event, REMOTE_PAYLOADS_ATTR, None) or []
+        candidates = [
+            candidate
+            for candidate in (self._candidate_from_segment(segment) for segment in segments)
+            if candidate is not None
+        ]
+        remote_candidates: list[VideoCandidate] = []
+        if isinstance(remote_payloads, list):
+            for payload in remote_payloads:
+                for segment in _raw_segments(payload):
+                    candidate = self._candidate_from_segment(segment)
+                    if candidate is not None:
+                        candidate.quoted = True
+                        candidate.origin = "remote-card"
+                        remote_candidates.append(candidate)
+        return candidates + remote_candidates
 
     async def _from_reply_lookup(self) -> list[VideoCandidate]:
         """前面都没找到时，用 get_msg 回查被引用的那条消息。"""
@@ -381,9 +416,12 @@ class VideoCollector:
 
     def _is_onebot(self) -> bool:
         try:
-            return self.event.get_platform_name() == "aiocqhttp"
+            name = str(self.event.get_platform_name() or "").casefold()
+            if any(token in name for token in ("onebot", "aiocqhttp", "llbot", "llonebot")):
+                return True
         except Exception:
-            return False
+            pass
+        return self._bot_call() is not None
 
     def _bot_call(self) -> Any:
         bot = getattr(self.event, "bot", None)
@@ -510,3 +548,18 @@ def _reply_id_from_raw(event: Any) -> str | None:
                 if value:
                     return value
     return None
+
+
+def _event_value(event: Any, name: str, default: Any = None) -> Any:
+    """读取事件或其 message_obj 上的共享状态。"""
+
+    for owner in (event, getattr(event, "message_obj", None)):
+        if owner is None:
+            continue
+        try:
+            value = getattr(owner, name, default)
+        except Exception:
+            continue
+        if value is not default:
+            return value
+    return default

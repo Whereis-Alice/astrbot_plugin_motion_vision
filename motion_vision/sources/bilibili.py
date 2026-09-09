@@ -13,6 +13,7 @@ from dataclasses import replace
 from typing import Any
 
 from ..bilibili import BilibiliClient, BilibiliError, extract_event_references
+from ..cards import REMOTE_ATTEMPTED_ATTR
 from ..models import MediaItem
 from ..settings import BilibiliSettings
 from .video import CollectResult
@@ -83,6 +84,8 @@ class BilibiliCollector:
         """
         references = extract_event_references(self.event)
         if any(reference.quoted for reference in references):
+            return references
+        if bool(_event_value(self.event, REMOTE_ATTEMPTED_ATTR, False)):
             return references
         message_id = _first_reply_id(self.event)
         if not message_id:
@@ -206,6 +209,21 @@ def _safe_get_messages(event: Any) -> Any:
     with contextlib.suppress(Exception):
         return event.get_messages()
     return None
+
+
+def _event_value(event: Any, name: str, default: Any = None) -> Any:
+    """读取事件或其 message_obj 上的共享状态。"""
+
+    for owner in (event, getattr(event, "message_obj", None)):
+        if owner is None:
+            continue
+        try:
+            value = getattr(owner, name, default)
+        except Exception:
+            continue
+        if value is not default:
+            return value
+    return default
 
 
 async def _fetch_reply(event: Any, message_id: str) -> Any:

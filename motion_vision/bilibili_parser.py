@@ -11,6 +11,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import Any
 
+from .cards import REMOTE_PAYLOADS_ATTR
+
 SHORT_HOSTS = frozenset(
     {
         "b23.tv",
@@ -315,7 +317,7 @@ def extract_event_references(event: Any) -> list[BilibiliReference]:
         if isinstance(value, str):
             # 结构化卡片可能把整份分享 JSON 原样塞进 raw_message；遍历前先
             # 截断，避免异常长文本让正则和递归解析占满事件循环。
-            normalized = _clean_text(value)[:MAX_EVENT_TEXT]
+            normalized = _clean_text(value).replace("\\/", "/")[:MAX_EVENT_TEXT]
             text_key = (normalized, quoted)
             if not normalized or text_key in seen_text:
                 return
@@ -400,6 +402,8 @@ def extract_event_references(event: Any) -> list[BilibiliReference]:
                 walk(getattr(owner, key, None))
             except Exception:
                 continue
+        with contextlib.suppress(Exception):
+            walk(getattr(owner, REMOTE_PAYLOADS_ATTR, None))
     return list(found.values())
 
 
@@ -475,12 +479,45 @@ def _first_mapping_text(value: dict[Any, Any], keys: tuple[str, ...]) -> str:
 
 def _parse_cq_body(value: str) -> dict[str, str]:
     result: dict[str, str] = {}
-    for token in value.split(","):
+    fields = _split_cq_fields(value)
+    for index, token in enumerate(fields):
         key, separator, raw = token.partition("=")
         if not separator or not key.strip():
             continue
-        result[key.strip()] = html.unescape(raw)
+        if key.strip().casefold() == "data" and index + 1 < len(fields):
+            raw = ",".join((raw, *fields[index + 1 :]))
+        result[html.unescape(key.strip())] = (
+            html.unescape(raw).replace("\\,", ",").replace("\\[", "[").replace("\\]", "]")
+        )
     return result
+
+
+def _split_cq_fields(value: str) -> list[str]:
+    """拆 CQ 参数时保留 ``&#44;`` 等转义逗号，避免 JSON 被截断。"""
+    fields: list[str] = []
+    current: list[str] = []
+    index = 0
+    entities = ("&#44;", "&#91;", "&#93;", "&amp;")
+    while index < len(value):
+        character = value[index]
+        if character == "\\" and index + 1 < len(value):
+            current.extend((character, value[index + 1]))
+            index += 2
+            continue
+        if character == "&":
+            entity = next((item for item in entities if value.startswith(item, index)), None)
+            if entity is not None:
+                current.append(entity)
+                index += len(entity)
+                continue
+        if character == ",":
+            fields.append("".join(current))
+            current = []
+        else:
+            current.append(character)
+        index += 1
+    fields.append("".join(current))
+    return fields
 
 
 def _allowed_host(value: str) -> bool:

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
+from motion_vision.cards import REMOTE_ATTEMPTED_ATTR, REMOTE_PAYLOADS_ATTR
 from motion_vision.sources.common import (
     decode_inline_image,
     is_http_url,
@@ -13,7 +15,7 @@ from motion_vision.sources.common import (
     resolve_local_path,
     strip_file_scheme,
 )
-from motion_vision.sources.video import VideoCandidate, _raw_segments
+from motion_vision.sources.video import VideoCandidate, VideoCollector, _raw_segments
 
 
 def test_parse_marker_with_name_and_path() -> None:
@@ -139,3 +141,34 @@ def test_raw_cq_message_is_normalized_into_onebot_segments() -> None:
     assert segments[0]["data"]["id"] == "42"
     assert segments[1]["data"]["name"] == "clip,one.mp4"
     assert segments[1]["data"]["file_id"] == "abc"
+
+
+def test_video_collector_reads_remote_state_saved_on_message_object() -> None:
+    remote = {
+        "type": "reply",
+        "data": {"id": "42"},
+        "message": [
+            {
+                "type": "video",
+                "data": {"file_name": "quoted.mp4", "url": "https://cdn.example/quoted.mp4"},
+            }
+        ],
+    }
+    message_obj = SimpleNamespace(
+        raw_message={"message": [{"type": "reply", "data": {"id": "42"}}]},
+        **{REMOTE_ATTEMPTED_ATTR: True, REMOTE_PAYLOADS_ATTR: [remote]},
+    )
+    event = SimpleNamespace(message_obj=message_obj, raw_message=None)
+    collector = VideoCollector(
+        request=SimpleNamespace(extra_user_content_parts=[]),
+        event=event,
+        client=None,
+        download_path_factory=lambda _suffix: Path("/tmp/unused"),
+    )
+
+    candidates = collector._from_raw_message()
+
+    assert len(candidates) == 1
+    assert candidates[0].name == "quoted.mp4"
+    assert candidates[0].url == "https://cdn.example/quoted.mp4"
+    assert candidates[0].quoted is True

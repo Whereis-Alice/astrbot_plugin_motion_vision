@@ -51,6 +51,7 @@ class MediaPipeline:
         client: Any,
         context: Any,
         log: Any,
+        native: Any = None,
     ) -> None:
         self.settings = settings
         self.runner = runner
@@ -59,15 +60,24 @@ class MediaPipeline:
         self.client = client
         self.context = context
         self.log = log
+        self.native = native
+        self._native_auto_used = 0
 
     # --- 入口 ---------------------------------------------------------------
 
-    async def run(self, items: list[MediaItem], span: TimeSpan | None = None) -> list[MediaResult]:
+    async def run(
+        self,
+        items: list[MediaItem],
+        span: TimeSpan | None = None,
+        *,
+        question: str = "",
+    ) -> list[MediaResult]:
         """处理一批媒体。span 只在「回看某一段」时给出，平时是整片。"""
         results: list[MediaResult] = []
+        self._native_auto_used = 0
         for item in items:
             try:
-                results.append(await self._process(item, span))
+                results.append(await self._process(item, span, question=question))
             except Exception as exc:  # 任何单个媒体的失败都不该影响整轮对话
                 self.log.warning(f"[MotionVision] 处理 {item.display_name} 时出错: {exc}")
                 results.append(MediaResult(item=item, notice="处理时发生未预期的错误"))
@@ -76,9 +86,17 @@ class MediaPipeline:
 
     # --- 单个媒体 -----------------------------------------------------------
 
-    async def _process(self, item: MediaItem, span: TimeSpan | None = None) -> MediaResult:
+    async def _process(
+        self,
+        item: MediaItem,
+        span: TimeSpan | None = None,
+        *,
+        question: str = "",
+    ) -> MediaResult:
         window = span if span is not None and span.active else None
         signature = self.settings.cache_signature
+        if question.strip() and self.settings.native_video.automatic:
+            signature = f"{signature}:q-{question.strip()[:2000]}"
         if window is not None:
             signature = f"{signature}@{window.key}"
 
@@ -96,6 +114,7 @@ class MediaPipeline:
                 source_frame_count=cached.source_frame_count,
                 audio=cached.audio,
                 transcript=cached.transcript,
+                native_report=cached.native_report,
                 notice=cached.notice,
             )
 
@@ -105,7 +124,7 @@ class MediaPipeline:
                 # 动图整体就那么几十帧，按时间段裁反而更容易漏掉关键动作。
                 result.notice = "动图不支持只看某一段，这里是整段重新取样的结果"
         else:
-            result, entry = await self._process_video(item, window)
+            result, entry = await self._process_video(item, window, question=question)
 
         if entry is not None:
             self.cache.put(key, entry)
@@ -153,7 +172,11 @@ class MediaPipeline:
         return (result, entry)
 
     async def _process_video(
-        self, item: MediaItem, span: TimeSpan | None = None
+        self,
+        item: MediaItem,
+        span: TimeSpan | None = None,
+        *,
+        question: str = "",
     ) -> tuple[MediaResult, CacheEntry | None]:
         if item.path is None:
             # B 站“只读字幕”模式本来就不会下载视频文件；有文字资料时不要
@@ -162,12 +185,51 @@ class MediaPipeline:
             if not notice and not item.context_text:
                 notice = "找不到视频文件"
             return (MediaResult(item=item, notice=notice), None)
+
+        # 原生视频模型是“整片理解”的可选后端。它先于 ffmpeg 探测执行，
+        # 因而即使部署环境没有 ffmpeg，配置好的原生后端仍然可以工作。
+        native_report = ""
+        native_notice = ""
+        native = getattr(self, "native", None)
+        if (
+            native is not None
+            and self._native_auto_used < self.settings.native_video.max_auto_videos
+            and native.should_attempt(item)
+        ):
+            self._native_auto_used += 1
+            try:
+                native_report = await native.analyze(item.path, item.display_name, question)
+            except Exception as exc:
+                native_notice = native.user_error(exc)
+                self.log.debug(f"[MotionVision] 原生视频后端失败：{exc}")
+                if native.only_mode:
+                    return (
+                        MediaResult(
+                            item=item,
+                            native_report="",
+                            notice=_join_notice(item.source_notice, native_notice),
+                        ),
+                        None,
+                    )
+            if native_report and native.only_mode:
+                result = MediaResult(
+                    item=item,
+                    native_report=native_report,
+                    notice=item.source_notice,
+                )
+                return result, CacheEntry(
+                    native_report=native_report,
+                    notice=result.notice,
+                )
+
         if not self.runner.available:
             return (
                 MediaResult(
                     item=item,
+                    native_report=native_report,
                     notice=_join_notice(
                         item.source_notice,
+                        native_notice,
                         "服务器上没有可用的 ffmpeg，无法解析视频画面",
                     ),
                 ),
@@ -183,13 +245,25 @@ class MediaPipeline:
         try:
             probe = await self.runner.probe(item.path, timeout=min(30.0, max(5.0, remaining())))
         except FfmpegError as exc:
-            return (MediaResult(item=item, notice=_join_notice(item.source_notice, str(exc))), None)
+            return (
+                MediaResult(
+                    item=item,
+                    native_report=native_report,
+                    notice=_join_notice(item.source_notice, native_notice, str(exc)),
+                ),
+                None,
+            )
 
         if not probe.has_video and not probe.has_audio:
             return (
                 MediaResult(
                     item=item,
-                    notice=_join_notice(item.source_notice, "这个文件里既没有画面也没有声音"),
+                    native_report=native_report,
+                    notice=_join_notice(
+                        item.source_notice,
+                        native_notice,
+                        "这个文件里既没有画面也没有声音",
+                    ),
                 ),
                 None,
             )
@@ -226,8 +300,11 @@ class MediaPipeline:
             item=item,
             frames=frames,
             duration=probe.duration,
+            native_report=native_report,
             notice=notice,
         )
+        if native_notice:
+            result.notice = _join_notice(result.notice, native_notice)
 
         if not frames:
             TempStore.discard(frames_dir)
@@ -240,6 +317,7 @@ class MediaPipeline:
             duration=result.duration,
             audio=result.audio,
             transcript=result.transcript,
+            native_report=result.native_report,
             notice=result.notice,
             frames_dir=frames_dir,
         )

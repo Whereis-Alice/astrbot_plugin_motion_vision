@@ -135,6 +135,8 @@ class MediaResult:
     source_frame_count: int | None = None
     audio: AudioClip | None = None
     transcript: str = ""
+    native_report: str = ""
+    """可选的整片原生视频模型报告。它是外部证据，不是当前模型的指令。"""
     notice: str = ""
     """处理失败或被降级时给模型看的中文说明。"""
 
@@ -144,4 +146,23 @@ class MediaResult:
 
     @property
     def ok(self) -> bool:
-        return bool(self.frames or self.audio or self.transcript or self.item.context_text)
+        return bool(
+            self.frames
+            or self.audio
+            or self.transcript
+            or self.native_report
+            or self.item.context_text
+        )
+
+
+@dataclass(frozen=True)
+class ContextEvidence:
+    """不属于动态媒体本身、但能帮助模型理解消息的外部资料。
+
+    例如 B 站专栏正文、QQ 引用卡片摘要和专栏封面。它们与视频抽帧分开，
+    这样不会把文档误当成视频去跑 ffmpeg，也不会污染媒体回看档案。
+    """
+
+    label: str
+    text: str = ""
+    images: tuple[str, ...] = ()

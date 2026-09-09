@@ -43,6 +43,7 @@ class BilibiliClient(_BilibiliClient):
         timeout_seconds: int = 180,
         max_download_mb: int = 100,
         log: Callable[[str], None] | None = None,
+        saved_cookie_provider: Callable[[], str] | None = None,
     ) -> None:
         super().__init__(
             client,
@@ -53,6 +54,7 @@ class BilibiliClient(_BilibiliClient):
             max_download_mb=max_download_mb,
             log=log,
             request_interval=lambda: API_MIN_INTERVAL,
+            saved_cookie_provider=saved_cookie_provider,
         )
 
 

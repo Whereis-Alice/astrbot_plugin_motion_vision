@@ -44,6 +44,7 @@ from .settings import MB, BilibiliSettings
 BILIBILI_API = "https://api.bilibili.com"
 VIEW_ENDPOINT = f"{BILIBILI_API}/x/web-interface/view"
 PLAYER_ENDPOINT = f"{BILIBILI_API}/x/player/v2"
+NAV_ENDPOINT = f"{BILIBILI_API}/x/web-interface/nav"
 
 MAX_API_BYTES = 4 * MB
 MAX_SUBTITLE_BYTES = 8 * MB
@@ -69,6 +70,7 @@ class BilibiliClient:
         max_download_mb: int = 100,
         log: Callable[[str], None] | None = None,
         request_interval: RequestInterval | None = None,
+        saved_cookie_provider: Callable[[], str] | None = None,
     ) -> None:
         self.client = client
         self._download_path = download_path_factory
@@ -77,6 +79,7 @@ class BilibiliClient:
         self.timeout_seconds = max(30, timeout_seconds)
         self.max_download_mb = max(1, max_download_mb)
         self._log = log or (lambda _message: None)
+        self._saved_cookie_provider = saved_cookie_provider
         self._request_interval = (
             request_interval if request_interval is not None else API_MIN_INTERVAL
         )
@@ -89,6 +92,11 @@ class BilibiliClient:
         self._downloads: OrderedDict[str, tuple[float, Path]] = OrderedDict()
         self._locks: dict[str, asyncio.Lock] = {}
         self._download_tail: asyncio.Task[Any] | None = None
+        self._transcript_service: Any = None
+
+    def set_transcript_service(self, service: Any) -> None:
+        """挂接可选的必剪回退服务，避免 B 站客户端反向依赖其实现。"""
+        self._transcript_service = service
 
     def configure(
         self,
@@ -97,17 +105,21 @@ class BilibiliClient:
         ffmpeg_path: str = "",
         timeout_seconds: int = 180,
         max_download_mb: int = 100,
+        saved_cookie_provider: Callable[[], str] | None = None,
     ) -> None:
-        old_cookie = self.settings.cookie
+        old_cookie = self._effective_cookie()
         old_subtitle_options = (
             self.settings.fetch_subtitles,
             self.settings.max_subtitle_chars,
+            self.settings.subtitle_language,
+            self.settings.subtitle_fallback,
         )
         self.settings = settings
         self.ffmpeg_path = ffmpeg_path
         self.timeout_seconds = max(30, timeout_seconds)
         self.max_download_mb = max(1, max_download_mb)
-        if old_cookie != settings.cookie:
+        self._saved_cookie_provider = saved_cookie_provider
+        if old_cookie != self._effective_cookie():
             self._metadata.clear()
             self._subtitles.clear()
             self._subtitle_failures.clear()
@@ -118,6 +130,8 @@ class BilibiliClient:
         if old_subtitle_options != (
             settings.fetch_subtitles,
             settings.max_subtitle_chars,
+            settings.subtitle_language,
+            settings.subtitle_fallback,
         ):
             self._subtitles.clear()
             self._subtitle_failures.clear()
@@ -247,25 +261,54 @@ class BilibiliClient:
             self._cache_put(self._metadata, info.key, info)
             return info
 
-    async def fetch_subtitle(self, info: BilibiliInfo) -> str:
+    async def fetch_subtitle(self, info: BilibiliInfo, max_chars: int | None = None) -> str:
         """读取并压缩带时间点的官方/AI 字幕；无字幕返回空字符串。"""
 
         if not self.settings.fetch_subtitles:
             return ""
+        return await self.fetch_subtitle_with_limit(
+            info,
+            self.settings.max_subtitle_chars if max_chars is None else max_chars,
+        )
+
+    async def fetch_subtitle_with_limit(self, info: BilibiliInfo, max_chars: int) -> str:
+        """读取字幕并按调用方上限截断；工具的完整模式复用同一实现。"""
+        max_chars = max(500, min(int(max_chars), 200000))
+        service = self._transcript_service
+        if service is not None:
+            # 统一走 TranscriptService，避免先在这里请求一次官方字幕，随后
+            # 为判断是否需要必剪回退又重复请求一次。官方字幕仍由本类的
+            # `_fetch_official_subtitle` 提供，依赖方向不会反过来。
+            with contextlib.suppress(Exception):
+                result = await service.fetch(
+                    info,
+                    full=max_chars >= self.settings.caption_full_max_chars,
+                    max_chars=max_chars,
+                    allow_fallback=True,
+                )
+                return result.text if result is not None else ""
+        official = await self._fetch_official_subtitle(info, max_chars)
+        if official or self.settings.subtitle_fallback != "bcut":
+            return official
+        return ""
+
+    async def _fetch_official_subtitle(self, info: BilibiliInfo, max_chars: int) -> str:
+        """只访问 B 站官方字幕接口；必剪服务通过外部挂接点调用。"""
         cache_key = (
-            f"{info.key}:{_cookie_fingerprint(self.settings.cookie)}:"
-            f"{self.settings.max_subtitle_chars}"
+            f"{info.key}:{_cookie_fingerprint(self._effective_cookie())}:"
+            f"{self.settings.subtitle_language}"
         )
         cached = self._cache_get(self._subtitles, cache_key)
         if cached is not None:
-            return cached
+            return _truncate_timeline(cached.splitlines(), max_chars) if cached else ""
         if self._subtitle_failure_cached(cache_key):
             return ""
+
         lock = self._locks.setdefault("subtitle:" + cache_key, asyncio.Lock())
         async with lock:
             cached = self._cache_get(self._subtitles, cache_key)
             if cached is not None:
-                return cached
+                return _truncate_timeline(cached.splitlines(), max_chars) if cached else ""
             if self._subtitle_failure_cached(cache_key):
                 return ""
             try:
@@ -284,7 +327,10 @@ class BilibiliClient:
                 if not isinstance(candidates, list):
                     self._cache_put(self._subtitles, cache_key, "")
                     return ""
-                ordered = self._ordered_subtitles(candidates)
+                ordered = self._ordered_subtitles(
+                    candidates,
+                    self.settings.subtitle_language,
+                )
                 if not ordered:
                     self._cache_put(self._subtitles, cache_key, "")
                     return ""
@@ -307,16 +353,35 @@ class BilibiliClient:
                     except (BilibiliError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                         self._log(f"B 站候选字幕不可用（{info.key}）：{type(exc).__name__}")
                         continue
-                    text = _truncate_timeline(lines, self.settings.max_subtitle_chars)
-                    if text:
-                        self._cache_put(self._subtitles, cache_key, text)
-                        return text
+                    if lines:
+                        # 缓存一份有界的时间线原文，之后切换普通/完整模式时
+                        # 只在本地重截断，不再为同一视频重复打 B 站接口。
+                        raw_text = _truncate_timeline(lines, 200000)
+                        self._cache_put(self._subtitles, cache_key, raw_text)
+                        return _truncate_timeline(raw_text.splitlines(), max_chars)
                 self._cache_put(self._subtitles, cache_key, "")
                 return ""
             except (BilibiliError, httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
                 self._log(f"B 站字幕读取失败（{info.key}）：{type(exc).__name__}")
                 self._mark_subtitle_failure(cache_key)
                 return ""
+
+    async def verify_cookie(self) -> tuple[bool, str]:
+        """验证当前有效 Cookie；返回 ``(是否登录, 用户名)``，不回显凭据。"""
+        cookie = self._effective_cookie()
+        if not cookie:
+            return False, ""
+        try:
+            payload = await self._api_json(NAV_ENDPOINT, params={})
+        except BilibiliError:
+            return False, ""
+        if _safe_int(payload.get("code"), -1) != 0:
+            return False, ""
+        data = payload.get("data")
+        if not isinstance(data, dict) or not data.get("isLogin"):
+            return False, ""
+        name = _clean_text(data.get("uname")) or _clean_text(data.get("mid"))
+        return True, name
 
     async def prepare(
         self,
@@ -404,7 +469,7 @@ class BilibiliClient:
                         download_video_sync,
                         info,
                         target,
-                        cookie=self.settings.cookie,
+                        cookie=self._effective_cookie(),
                         ffmpeg_path=self.ffmpeg_path,
                         max_download_mb=self.max_download_mb,
                         timeout_seconds=self.timeout_seconds,
@@ -554,8 +619,9 @@ class BilibiliClient:
         request_headers = {"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"}
         if headers:
             request_headers.update(headers)
-        if allow_cookie and self.settings.cookie:
-            request_headers["Cookie"] = self.settings.cookie
+        cookie = self._effective_cookie()
+        if allow_cookie and cookie:
+            request_headers["Cookie"] = cookie
 
         current_url = url
         current_params = params
@@ -658,11 +724,19 @@ class BilibiliClient:
             return API_MIN_INTERVAL
 
     @staticmethod
-    def _ordered_subtitles(candidates: list[Any]) -> list[dict[str, Any]]:
+    def _ordered_subtitles(
+        candidates: list[Any], language_preference: str = "auto"
+    ) -> list[dict[str, Any]]:
         valid = [item for item in candidates if isinstance(item, dict) and item.get("subtitle_url")]
         if not valid:
             return []
-        preferred = ("zh-cn", "zh-hans", "zh-hant", "zh-hk", "ai-zh", "en-us", "en")
+        preference = (language_preference or "auto").casefold()
+        if preference == "en":
+            preferred = ("en-us", "en", "zh-cn", "zh-hans", "zh-hant", "ai-zh")
+        elif preference not in {"auto", "zh"} and preference:
+            preferred = (preference, "zh-cn", "zh-hans", "zh-hant", "ai-zh", "en-us", "en")
+        else:
+            preferred = ("zh-cn", "zh-hans", "zh-hant", "zh-hk", "ai-zh", "en-us", "en")
 
         def rank(item: dict[str, Any]) -> tuple[int, int]:
             language = _clean_text(item.get("lan")).casefold()
@@ -678,6 +752,14 @@ class BilibiliClient:
             return position, _safe_int(item.get("ai_type"))
 
         return sorted(valid, key=rank)
+
+    def _effective_cookie(self) -> str:
+        if self.settings.use_saved_cookie and self._saved_cookie_provider is not None:
+            with contextlib.suppress(Exception):
+                saved = str(self._saved_cookie_provider() or "").strip()
+                if saved:
+                    return saved
+        return self.settings.cookie
 
     @staticmethod
     def _cache_get(cache: OrderedDict[str, tuple[float, Any]], key: str) -> Any | None:
