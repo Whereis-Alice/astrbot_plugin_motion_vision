@@ -81,6 +81,9 @@ def test_animation_budget_never_drops_below_two():
 def test_animation_override_wins():
     preset = DETAIL_PRESETS["frugal"]
     assert animation_frame_budget(40, 0, preset, override=9) == 9
+    # 明确指定 1 帧时也要尊重用户选择，方便只接受单图的服务商。
+    assert animation_frame_budget(40, 50 * MB, preset, override=1) == 1
+    assert animation_frame_budget(4, 0, preset, override=4) == 4
     # 覆盖值也不能超过源帧数
     assert animation_frame_budget(5, 0, preset, override=30) == 5
 

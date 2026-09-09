@@ -16,6 +16,9 @@ def test_empty_config_falls_back_to_defaults():
     assert settings.video.max_videos_per_request == 2
     assert settings.audio.mode == "off"
     assert settings.injection.keep_frames_in_history is False
+    assert settings.bilibili.enabled is True
+    assert settings.bilibili.fetch_subtitles is True
+    assert settings.bilibili.max_subtitle_chars == 12000
     assert settings.advanced.max_images_per_request == 48
 
 
@@ -72,6 +75,24 @@ def test_bool_accepts_strings():
     assert settings.animation.enabled is True
 
 
+def test_bilibili_options_are_clamped_and_normalised():
+    settings = load_settings(
+        {
+            "bilibili": {
+                "enabled": "false",
+                "fetch_subtitles": "on",
+                "cookie": " SESSDATA=secret ",
+                "max_subtitle_chars": 999999,
+            }
+        }
+    )
+
+    assert settings.bilibili.enabled is False
+    assert settings.bilibili.fetch_subtitles is True
+    assert settings.bilibili.cookie == "SESSDATA=secret"
+    assert settings.bilibili.max_subtitle_chars == 50000
+
+
 def test_cache_signature_tracks_output_affecting_options():
     frugal = load_settings({"sampling": {"detail_level": "节省"}})
     detailed = load_settings({"sampling": {"detail_level": "精细"}})
@@ -97,3 +118,23 @@ def test_custom_api_requires_both_base_and_key():
     assert partial.audio.use_custom_api is False
     assert full.audio.use_custom_api is True
     assert full.audio.api_base == "https://example.com/v1"
+
+
+def test_cache_signature_tracks_transcription_backend_options():
+    base = load_settings({"audio": {"mode": "转写文字"}})
+    other_model = load_settings(
+        {"audio": {"mode": "转写文字", "api_base": "https://stt.example/v1", "model": "large"}}
+    )
+    other_key = load_settings(
+        {
+            "audio": {
+                "mode": "转写文字",
+                "api_base": "https://stt.example/v1",
+                "api_key": "different",
+                "model": "large",
+            }
+        }
+    )
+
+    assert base.cache_signature != other_model.cache_signature
+    assert other_model.cache_signature != other_key.cache_signature

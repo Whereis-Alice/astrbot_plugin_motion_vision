@@ -13,6 +13,9 @@ QQ 的视频有很多种到达方式，因此按可靠性从高到低逐层降�
 
 from __future__ import annotations
 
+import html
+import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,6 +33,12 @@ from .common import (
     redact_url,
     resolve_local_path,
 )
+
+_CQ_SEGMENT_PATTERN = re.compile(
+    r"\[CQ:(?P<type>[A-Za-z0-9_-]+)(?:,(?P<body>[^\]]*))?\]",
+    re.IGNORECASE,
+)
+_MAX_RAW_SEGMENTS = 64
 
 
 @dataclass
@@ -56,7 +65,9 @@ class VideoCandidate:
             keys.append(f"url:{self.url}")
         if self.raw_path:
             keys.append(f"path:{self.raw_path.casefold()}")
-        if self.name:
+        # 文件名只能在没有更可靠标识时参与去重；不同来源完全可能都叫
+        # ``video.mp4``，不能因为同名就把第二个视频吞掉。
+        if self.name and not keys:
             keys.append(f"name:{Path(self.name).name.casefold()}")
         return keys
 
@@ -91,6 +102,7 @@ class VideoCollector:
         self.include_group_files = include_group_files
         self.search_dirs = search_dirs
         self._seen: set[str] = set()
+        self._seen_paths: set[str] = set()
 
     # --- 对外入口 -----------------------------------------------------------
 
@@ -98,10 +110,14 @@ class VideoCollector:
         result = CollectResult()
 
         candidates = self._from_markers()
-        marker_hit = bool(candidates)
-        candidates += self._from_chain(skip_video_components=marker_hit)
+        # 标记和消息链经常是同一附件的两份表示，但也可能各自包含不同的
+        # 视频；全部收集后按规范化本地路径去重，不用“有 marker 就跳过整条链”
+        # 这种会漏掉第二个视频的捷径。
+        candidates += self._from_chain(skip_video_components=False)
         candidates += self._from_raw_message()
-        if not candidates:
+        # 一条消息可以同时包含直接发送的视频和一个未展开的引用视频。不能因为
+        # 前者已经找到，就跳过对后者的一次有界回查。
+        if not candidates or not any(candidate.quoted for candidate in candidates):
             candidates += await self._from_reply_lookup()
 
         for candidate in candidates:
@@ -198,7 +214,11 @@ class VideoCollector:
 
     def _from_raw_message(self) -> list[VideoCandidate]:
         """OneBot 原始上报里常常带着消息链丢掉的 file_id 与 file_size。"""
-        segments = _raw_segments(getattr(self.event.message_obj, "raw_message", None))
+        message_obj = getattr(self.event, "message_obj", None)
+        raw = getattr(message_obj, "raw_message", None)
+        if raw is None:
+            raw = getattr(self.event, "raw_message", None)
+        segments = _raw_segments(raw)
         return [c for c in (self._candidate_from_segment(s) for s in segments) if c]
 
     async def _from_reply_lookup(self) -> list[VideoCandidate]:
@@ -214,7 +234,9 @@ class VideoCollector:
                     message_id = component.id
                     break
         except Exception:
-            return []
+            message_id = None
+        if message_id is None:
+            message_id = _reply_id_from_raw(self.event)
         if message_id is None:
             return []
 
@@ -264,10 +286,14 @@ class VideoCollector:
 
         local = resolve_local_path(candidate.raw_path, self.search_dirs)
         if local is not None:
+            if self._path_seen(local):
+                return None
             return self._make_item(candidate, local, owned=False)
 
         component_path, component_url = await self._ask_component(candidate)
         if component_path is not None:
+            if self._path_seen(component_path):
+                return None
             return self._make_item(candidate, component_path, owned=False, url=component_url)
 
         url = candidate.url or component_url
@@ -407,6 +433,7 @@ class VideoCollector:
     ) -> MediaItem:
         identity = f"path:{str(path).casefold()}"
         self._seen.add(identity)
+        self._seen_paths.add(str(path).casefold())
         return MediaItem(
             kind=MediaKind.VIDEO,
             name=candidate.name or path.name,
@@ -419,13 +446,67 @@ class VideoCollector:
             source_url=url or candidate.url,
         )
 
+    def _path_seen(self, path: Path) -> bool:
+        return str(path).casefold() in self._seen_paths
+
 
 def _raw_segments(raw: Any) -> list[Any]:
-    """从 OneBot 上报字典里取出消息段列表。"""
-    if not isinstance(raw, dict):
+    """从 OneBot 字典、JSON 字符串或 CQ 码中取出消息段列表。"""
+    if isinstance(raw, dict):
+        for key in ("message", "messages"):
+            value = raw.get(key)
+            if isinstance(value, (list, tuple)):
+                return list(value)[:_MAX_RAW_SEGMENTS]
+            if isinstance(value, str):
+                segments = _raw_segments(value)
+                if segments:
+                    return segments
+        if str(raw.get("type") or "").casefold() in {"file", "video", "reply"}:
+            return [raw]
         return []
-    for key in ("message", "messages"):
-        value = raw.get(key)
-        if isinstance(value, list):
-            return value
-    return []
+    if isinstance(raw, (list, tuple)):
+        return list(raw)[:_MAX_RAW_SEGMENTS]
+    if not isinstance(raw, str):
+        return []
+
+    text = raw.strip()
+    if not text:
+        return []
+    if text.startswith(("{", "[")):
+        try:
+            decoded = json.loads(html.unescape(text))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = None
+        if decoded is not None and decoded is not raw:
+            segments = _raw_segments(decoded)
+            if segments:
+                return segments
+
+    segments: list[dict[str, Any]] = []
+    for match in _CQ_SEGMENT_PATTERN.finditer(text):
+        body: dict[str, str] = {}
+        for token in (match.group("body") or "").split(","):
+            key, separator, value = token.partition("=")
+            if separator and key.strip():
+                body[key.strip()] = html.unescape(value)
+        segments.append({"type": match.group("type").casefold(), "data": body})
+        if len(segments) >= _MAX_RAW_SEGMENTS:
+            break
+    return segments
+
+
+def _reply_id_from_raw(event: Any) -> str | None:
+    message_obj = getattr(event, "message_obj", None)
+    raw = getattr(message_obj, "raw_message", None)
+    if raw is None:
+        raw = getattr(event, "raw_message", None)
+    for segment in _raw_segments(raw):
+        if str(segment.get("type") or "").casefold() != "reply":
+            continue
+        data = segment.get("data")
+        if isinstance(data, dict):
+            for key in ("id", "message_id", "messageId"):
+                value = str(data.get(key) or "").strip()
+                if value:
+                    return value
+    return None

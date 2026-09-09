@@ -23,6 +23,7 @@ class CacheEntry:
     source_frame_count: int | None = None
     transcript: str = ""
     audio: AudioClip | None = None
+    notice: str = ""
     frames_dir: Path | None = None
     created_at: float = field(default_factory=time.time)
 

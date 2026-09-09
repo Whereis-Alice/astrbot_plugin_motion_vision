@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: 安装依赖
-        run: python -m pip install --upgrade pip pillow httpx ruff pytest
+        run: python -m pip install --upgrade pip -r requirements.txt ruff pytest
       - name: 代码检查
         run: |
           ruff check .

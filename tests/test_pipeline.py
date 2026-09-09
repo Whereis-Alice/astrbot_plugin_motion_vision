@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from pathlib import Path
 
@@ -104,3 +105,19 @@ def test_generous_budget_changes_nothing() -> None:
 
     assert len(result.frames) == 8
     assert result.notice == ""
+
+
+def test_text_only_video_source_does_not_report_missing_file() -> None:
+    pipeline = _pipeline()
+    item = MediaItem(
+        kind=MediaKind.VIDEO,
+        name="B站视频",
+        identity="bilibili:test",
+        context_text="【B站视频资料】带时间点字幕",
+    )
+
+    result, cache_entry = asyncio.run(pipeline._process_video(item))
+
+    assert result.notice == ""
+    assert result.item.context_text
+    assert cache_entry is None

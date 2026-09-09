@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,10 @@ class MediaPipeline:
             signature = f"{signature}@{window.key}"
 
         key = fingerprint(item.path, item.data, signature)
+        if item.path is None and item.data is None:
+            # 只有文字资料的来源（例如 B 站字幕）没有文件指纹，不能全部落到
+            # fingerprint() 的 unknown 键上，否则不同视频会互相串缓存。
+            key = f"identity:{item.identity}|{signature}"
         cached = self.cache.get(key)
         if cached is not None:
             return MediaResult(
@@ -91,6 +96,7 @@ class MediaPipeline:
                 source_frame_count=cached.source_frame_count,
                 audio=cached.audio,
                 transcript=cached.transcript,
+                notice=cached.notice,
             )
 
         if item.kind is MediaKind.ANIMATION:
@@ -135,11 +141,13 @@ class MediaPipeline:
             frames=sample.frames,
             duration=sample.duration,
             source_frame_count=sample.total_frames,
+            notice=item.source_notice,
         )
         entry = CacheEntry(
             frames=list(sample.frames),
             duration=sample.duration,
             source_frame_count=sample.total_frames,
+            notice=result.notice,
             frames_dir=out_dir,
         )
         return (result, entry)
@@ -148,12 +156,20 @@ class MediaPipeline:
         self, item: MediaItem, span: TimeSpan | None = None
     ) -> tuple[MediaResult, CacheEntry | None]:
         if item.path is None:
-            return (MediaResult(item=item, notice="找不到视频文件"), None)
+            # B 站“只读字幕”模式本来就不会下载视频文件；有文字资料时不要
+            # 再伪造一条“找不到视频文件”的失败提示，避免模型误以为字幕也无效。
+            notice = item.source_notice
+            if not notice and not item.context_text:
+                notice = "找不到视频文件"
+            return (MediaResult(item=item, notice=notice), None)
         if not self.runner.available:
             return (
                 MediaResult(
                     item=item,
-                    notice="服务器上没有可用的 ffmpeg，无法解析视频画面",
+                    notice=_join_notice(
+                        item.source_notice,
+                        "服务器上没有可用的 ffmpeg，无法解析视频画面",
+                    ),
                 ),
                 None,
             )
@@ -167,14 +183,20 @@ class MediaPipeline:
         try:
             probe = await self.runner.probe(item.path, timeout=min(30.0, max(5.0, remaining())))
         except FfmpegError as exc:
-            return (MediaResult(item=item, notice=str(exc)), None)
+            return (MediaResult(item=item, notice=_join_notice(item.source_notice, str(exc))), None)
 
         if not probe.has_video and not probe.has_audio:
-            return (MediaResult(item=item, notice="这个文件里既没有画面也没有声音"), None)
+            return (
+                MediaResult(
+                    item=item,
+                    notice=_join_notice(item.source_notice, "这个文件里既没有画面也没有声音"),
+                ),
+                None,
+            )
 
         frames_dir: Path | None = self.store.frames_dir("video")
         frames: list[SampledFrame] = []
-        notice = ""
+        notice = item.source_notice
 
         if probe.has_video and remaining() > 5:
             # 只看一段时，帧数按这一段的长度算——否则 10 秒的片段会拿到整片的预算。
@@ -196,7 +218,7 @@ class MediaPipeline:
                     timeout=max(10.0, remaining()),
                 )
             except FfmpegError as exc:
-                notice = str(exc)
+                notice = _join_notice(notice, str(exc))
         elif probe.has_video:
             notice = "处理时间已用尽，未能抽取画面"
 
@@ -218,6 +240,7 @@ class MediaPipeline:
             duration=result.duration,
             audio=result.audio,
             transcript=result.transcript,
+            notice=result.notice,
             frames_dir=frames_dir,
         )
         return (result, entry if result.ok else None)
@@ -242,15 +265,25 @@ class MediaPipeline:
         except FfmpegError as exc:
             self.log.debug(f"[MotionVision] 音轨提取失败: {exc}")
             TempStore.discard(audio_path)
+            result.notice = _join_notice(result.notice, "未能读取视频音轨，无法确认其中的声音内容")
             return
 
         if audio_cfg.transcribe and remaining() > 3:
             try:
-                result.transcript = await transcribe(
-                    clip.path, audio_cfg, self.context, self.client
+                result.transcript = await asyncio.wait_for(
+                    transcribe(clip.path, audio_cfg, self.context, self.client),
+                    timeout=max(1.0, remaining()),
+                )
+            except asyncio.TimeoutError:
+                self.log.debug("[MotionVision] 语音转写超出本视频的处理时间预算")
+                result.notice = _join_notice(
+                    result.notice, "语音转写超时，无法确认视频中的说话内容"
                 )
             except SttError as exc:
                 self.log.debug(f"[MotionVision] 语音转写失败: {exc}")
+                result.notice = _join_notice(
+                    result.notice, "语音转写失败，无法确认视频中的说话内容"
+                )
 
         if audio_cfg.attach:
             result.audio = clip
@@ -312,3 +345,9 @@ class MediaPipeline:
             SampledFrame(f.path, position, f.timestamp, f.size_bytes)
             for position, f in enumerate(picked)
         ]
+
+
+def _join_notice(*parts: str) -> str:
+    """合并来源阶段和媒体阶段的降级说明，避免重复分号。"""
+
+    return "；".join(part.strip("； ") for part in parts if part and part.strip("； "))

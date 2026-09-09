@@ -177,6 +177,23 @@ def test_audio_and_transcript_are_attached(tmp_path: Path) -> None:
     assert any("你好世界" in text for text in _texts(request))
 
 
+def test_text_only_source_context_is_injected(tmp_path: Path) -> None:
+    item = MediaItem(
+        kind=MediaKind.VIDEO,
+        name="B站视频",
+        identity="bilibili:BV1",
+        context_text="【B站视频资料】标题：测试视频\n[0:03] 发生了变化",
+    )
+    request = FakeRequest()
+
+    report = inject(request, [MediaResult(item=item)], _settings())
+
+    assert report.media == 1
+    assert report.frames == 0
+    assert report.transcripts == 1
+    assert any("测试视频" in text for text in _texts(request))
+
+
 def test_notice_only_result_still_informs_the_model(tmp_path: Path) -> None:
     item = MediaItem(kind=MediaKind.VIDEO, name="big.mp4", identity="id-2")
     request = FakeRequest()

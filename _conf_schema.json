@@ -78,6 +78,37 @@
       }
     }
   },
+  "bilibili": {
+    "description": "B 站链接与字幕",
+    "type": "object",
+    "hint": "识别消息、分享文本和 QQ 引用卡片里的 B 站视频；画面仍走上面的通用视频流水线。",
+    "items": {
+      "enabled": {
+        "description": "解析 B 站视频链接",
+        "type": "bool",
+        "default": true,
+        "hint": "支持 BV 号、av 号、完整链接、b23.tv 短链，以及 QQ/OneBot 引用卡片。关闭后不再因 B 站链接下载视频。"
+      },
+      "fetch_subtitles": {
+        "description": "读取 B 站字幕",
+        "type": "bool",
+        "default": true,
+        "hint": "把官方或 AI 字幕作为带时间点的文字资料交给模型；没有字幕时自动只用画面。"
+      },
+      "cookie": {
+        "description": "B 站 Cookie（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "填写例如 SESSDATA=...; bili_jct=...。公开视频通常无需填写，但登录态有助于获取 AI 字幕。只会发送给 B 站接口，不要把 Cookie 发到聊天中。"
+      },
+      "max_subtitle_chars": {
+        "description": "单个视频字幕最多保留多少字",
+        "type": "int",
+        "default": 12000,
+        "hint": "字幕过长时会尽量保留开头、中段和结尾，避免整段字幕挤满上下文。"
+      }
+    }
+  },
   "audio": {
     "description": "声音",
     "type": "object",

@@ -66,6 +66,13 @@ class MediaItem:
     owned_temp: bool = False
     """该文件是否由插件下载/生成，处理完可以删除。"""
 
+    context_text: str = ""
+    """来源附带的文字资料，例如 B 站字幕或卡片元数据。"""
+    context_label: str = ""
+    """context_text 的来源名称，用于给模型做清晰的边界提示。"""
+    source_notice: str = ""
+    """来源阶段已知的降级说明，例如 B 站视频下载失败但字幕仍可用。"""
+
     @property
     def display_name(self) -> str:
         return self.name or ("动图" if self.kind is MediaKind.ANIMATION else "视频")
@@ -137,4 +144,4 @@ class MediaResult:
 
     @property
     def ok(self) -> bool:
-        return bool(self.frames or self.audio or self.transcript)
+        return bool(self.frames or self.audio or self.transcript or self.item.context_text)

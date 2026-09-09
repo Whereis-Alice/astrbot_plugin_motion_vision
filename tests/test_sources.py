@@ -13,6 +13,7 @@ from motion_vision.sources.common import (
     resolve_local_path,
     strip_file_scheme,
 )
+from motion_vision.sources.video import VideoCandidate, _raw_segments
 
 
 def test_parse_marker_with_name_and_path() -> None:
@@ -120,3 +121,21 @@ def test_resolve_local_path_rejects_remote_and_missing(tmp_path: Path) -> None:
     assert resolve_local_path("base64://aGk=") is None
     assert resolve_local_path("") is None
     assert resolve_local_path(str(tmp_path / "missing.mp4")) is None
+
+
+def test_video_candidate_does_not_deduplicate_distinct_urls_by_filename() -> None:
+    first = VideoCandidate(name="video.mp4", url="https://a.example/video.mp4")
+    second = VideoCandidate(name="video.mp4", url="https://b.example/video.mp4")
+
+    assert set(first.identity_keys()).isdisjoint(second.identity_keys())
+
+
+def test_raw_cq_message_is_normalized_into_onebot_segments() -> None:
+    raw = "[CQ:reply,id=42][CQ:file,name=clip&#44;one.mp4,file_id=abc]"
+
+    segments = _raw_segments(raw)
+
+    assert [segment["type"] for segment in segments] == ["reply", "file"]
+    assert segments[0]["data"]["id"] == "42"
+    assert segments[1]["data"]["name"] == "clip,one.mp4"
+    assert segments[1]["data"]["file_id"] == "abc"

@@ -41,6 +41,8 @@ class MediaRecord:
     name: str
     path: Path | None = None
     source_url: str = ""
+    context_text: str = ""
+    context_label: str = ""
     duration: float | None = None
     frames_seen: int = 0
     """已经给模型看过多少帧，用于状态输出和日志。"""
@@ -108,6 +110,8 @@ class MediaRegistry:
         name: str,
         path: Path | None = None,
         source_url: str = "",
+        context_text: str = "",
+        context_label: str = "",
         duration: float | None = None,
         frames_seen: int = 0,
         owned_temp: bool = False,
@@ -121,6 +125,8 @@ class MediaRegistry:
             existing.name = name or existing.name
             existing.path = path or existing.path
             existing.source_url = source_url or existing.source_url
+            existing.context_text = context_text or existing.context_text
+            existing.context_label = context_label or existing.context_label
             existing.duration = duration if duration is not None else existing.duration
             existing.frames_seen = frames_seen or existing.frames_seen
             existing.owned_temp = existing.owned_temp or owned_temp
@@ -135,6 +141,8 @@ class MediaRegistry:
             name=name,
             path=path,
             source_url=source_url,
+            context_text=context_text,
+            context_label=context_label,
             duration=duration,
             frames_seen=frames_seen,
             owned_temp=owned_temp,

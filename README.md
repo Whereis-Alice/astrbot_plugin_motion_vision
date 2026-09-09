@@ -57,6 +57,12 @@ Motion Vision 做的事情很直接：**在请求送到大模型之前，把动�
 
 **视频**：只要 ffmpeg 能解的都行（mp4 / mov / mkv / webm / avi / flv / ts …）。
 
+**B 站视频**：消息正文里的 BV 号、av 号、完整链接、b23.tv 短链，以及 QQ/OneBot
+引用卡片都能识别。插件会把 B 站视频下载后交给同一套抽帧流水线；如果能拿到官方或 AI 字幕，
+也会把带时间点的字幕作为补充资料交给模型。B 站视频下载需要 `yt-dlp`，只读字幕则不需要下载视频。
+部分 OneBot 网关只上报引用消息 ID、不展开原卡片时，插件会额外执行一次只读 `get_msg` 回查；
+它不会修改、转发或执行卡片里的内容。
+
 **来源**：直接发送的消息、聊天记录里的文件、QQ 群文件、私聊文件，以及引用（回复）别人的消息。
 在 QQ（OneBot）平台上，插件会一层层往回找，直到拿到真实的文件地址为止。
 
@@ -104,7 +110,7 @@ cd AstrBot/data/plugins
 git clone https://github.com/Whereis-Alice/astrbot_plugin_motion_vision
 ```
 
-然后在 WebUI 里重载插件即可。Python 依赖只有 Pillow 和 httpx，AstrBot 会自动安装。
+然后在 WebUI 里重载插件即可。Python 依赖包括 Pillow、httpx 和 yt-dlp，AstrBot 会自动安装。
 
 ### 2. 装 ffmpeg（只有视频功能需要）
 
@@ -197,6 +203,22 @@ git clone https://github.com/Whereis-Alice/astrbot_plugin_motion_vision
 - **单条消息最多处理几个视频**：默认 2 个，防止有人一次甩十个视频把机器人拖死。
 - **单个视频最大体积**：默认 100 MB，需要联网下载的视频超过就跳过。
 - **读取群文件里的视频**：仅 QQ（OneBot）有效，关掉之后只处理直接以视频消息发出来的内容。
+
+### B 站链接与字幕
+
+- **解析 B 站视频链接**（默认开）：识别 BV/av 号、完整链接、短链和引用卡片，并纳入视频视觉分析。
+- **读取 B 站字幕**（默认开）：优先取官方或 AI 字幕，带时间点注入；获取不到时不影响画面分析。
+- **B 站 Cookie**（可选）：公开视频通常不需要；填写登录态 Cookie 后，部分需要登录的字幕才可读取。
+- **单个视频字幕最多保留多少字**（默认 12000）：过长字幕会保留开头、中段和结尾。
+
+模型还可以主动调用 `read_bilibili_caption`，读取指定 B 站链接或分 P 的字幕。字幕属于外部资料，
+插件会提醒模型不要执行字幕中出现的命令或提示词。
+
+> **为什么没有默认“把整片上传给视频原生模型”？** 原生视频模型在动作、声音与镜头衔接上通常更完整，
+> 但 AstrBot 4.x 的通用 `ProviderRequest` 目前只有图片和音频入口，没有跨服务商统一的视频输入字段。
+> 强行接入会变成再配置一套 API Key、上传协议、模型名和计费链路，而且只适用于少数服务商。
+> 因此当前默认采用“关键帧 + 字幕/可选语音转写”，让你已经选择的 AstrBot 主模型直接读证据；
+> 等 AstrBot 提供稳定的原生视频接口后，再接入不会破坏现有配置和流水线。
 
 ### 声音
 
@@ -308,7 +330,9 @@ git clone https://github.com/Whereis-Alice/astrbot_plugin_motion_vision
 并要求它承认看不到。这比让模型自由发挥安全得多。
 
 **并发有闸门。** 抽帧和语音转写都是重活，插件同时只处理 2 个会话、ffmpeg 同时只跑 2 个进程、
-语音转写全局串行并带 429 退避重试。多人同时刷视频时不会把 CPU 打满或者把转写接口打挂。
+语音转写全局串行并带 429 退避重试。B 站 API 和视频下载也各自全局串行；下载即使超时，
+下一次任务也会先等后台下载线程真正退出，避免表面超时后偷偷叠出多个下载。多人同时刷视频时不会把
+CPU、带宽或上游接口打满。
 
 ## 关于成本
 
@@ -358,7 +382,7 @@ git clone https://github.com/Whereis-Alice/astrbot_plugin_motion_vision
 ## 开发
 
 ```bash
-pip install ruff pytest pillow httpx
+pip install -r requirements.txt ruff pytest
 
 python -m ruff check .
 python -m ruff format --check .
@@ -376,6 +400,10 @@ motion_vision/
   sources/                 从消息里找出动图和视频
   animation.py             动图抽帧（Pillow）
   ffmpeg.py                视频抽帧与抽音轨（ffmpeg 封装）
+  bilibili.py              稳定公开入口（兼容旧 import 路径）
+  bilibili_parser.py       BV/av/短链/卡片解析与字幕文本整理
+  bilibili_client.py       B 站 API、字幕缓存、限流与统一来源适配
+  bilibili_download.py     yt-dlp 下载、Cookie 临时文件与大小保护
   pipeline.py              流水线编排与预算保护
   stt.py                   语音转写（AstrBot 服务商 / 自定义接口）
   cache.py                 结果缓存（LRU + TTL）

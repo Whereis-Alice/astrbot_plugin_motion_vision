@@ -56,10 +56,13 @@ async def _via_provider(path: Path, provider: Any) -> str:
     getter = getattr(provider, "get_text", None)
     if not callable(getter):
         raise SttError("所选服务商不支持语音转写")
-    try:
-        return str(await getter(audio_url=str(path)) or "")
-    except Exception as exc:
-        raise SttError(f"服务商转写失败：{exc}") from exc
+    # AstrBot provider 和自定义 OpenAI 兼容接口共用同一条上游转写闸门，
+    # 避免多个会话同时上传音频触发服务商 429。
+    async with _GATE:
+        try:
+            return str(await getter(audio_url=str(path)) or "")
+        except Exception as exc:
+            raise SttError(f"服务商转写失败：{exc}") from exc
 
 
 def _retry_delay(attempt: int, response: httpx.Response | None) -> float:

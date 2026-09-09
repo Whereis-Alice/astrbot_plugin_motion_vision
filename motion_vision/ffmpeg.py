@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import shutil
 import subprocess
@@ -153,25 +154,35 @@ class FfmpegRunner:
 
     async def _run(self, args: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         async with self._gate():
+            process: asyncio.subprocess.Process | None = None
             try:
-                return await asyncio.wait_for(
-                    asyncio.to_thread(
-                        subprocess.run,
-                        args,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        creationflags=_NO_WINDOW,
-                    ),
-                    timeout=timeout,
+                spawn_options: dict[str, object] = {
+                    "stdout": asyncio.subprocess.PIPE,
+                    "stderr": asyncio.subprocess.PIPE,
+                }
+                if _NO_WINDOW:
+                    spawn_options["creationflags"] = _NO_WINDOW
+                process = await asyncio.create_subprocess_exec(*args, **spawn_options)
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=max(0.1, timeout)
                 )
-            except TimeoutError as exc:
+            except asyncio.TimeoutError as exc:
+                await _stop_process(process)
                 raise FfmpegError("处理超时，可能是文件过大或机器负载过高") from exc
+            except asyncio.CancelledError:
+                await _stop_process(process)
+                raise
             except FileNotFoundError as exc:
                 raise FfmpegError("找不到 ffmpeg 可执行文件") from exc
             except OSError as exc:
                 raise FfmpegError(f"调用 ffmpeg 失败：{exc}") from exc
+
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=process.returncode if process is not None else -1,
+                stdout=stdout.decode("utf-8", errors="replace") if stdout else "",
+                stderr=stderr.decode("utf-8", errors="replace") if stderr else "",
+            )
 
     # --- 探测 ---------------------------------------------------------------
 
@@ -229,10 +240,15 @@ class FfmpegRunner:
         scale = _scale_filter(max_side)
         frames: list[SampledFrame] = []
         failures: list[str] = []
+        deadline = asyncio.get_running_loop().time() + max(0.1, timeout)
 
         for slot, window in enumerate(windows):
             if window.count <= 0:
                 continue
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                failures.append("处理超时，可能是文件过大或机器负载过高")
+                break
             pattern = out_dir / f"w{slot:02d}_%03d.jpg"
             args = [self.tools.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
             if window.start > 0:
@@ -259,10 +275,20 @@ class FfmpegRunner:
                 str(pattern),
             ]
 
-            result = await self._run(args, timeout)
+            result = None
+            try:
+                result = await self._run(args, remaining)
+            except FfmpegError as exc:
+                # 长视频由多个窗口组成。某个窗口超时或损坏时，保留前面已经
+                # 成功抽出的帧；只有一帧都没有时才把整个媒体判定为失败。
+                failures.append(str(exc))
+                if "超时" in str(exc) or remaining <= 0.2:
+                    break
             produced = sorted(out_dir.glob(f"w{slot:02d}_*.jpg"))
-            if result.returncode != 0 and not produced:
+            if result is not None and result.returncode != 0 and not produced:
                 failures.append(_last_line(result.stderr))
+                continue
+            if not produced:
                 continue
 
             stamps = window.timestamps()
@@ -377,3 +403,13 @@ def _size_of(path: Path) -> int:
         return path.stat().st_size
     except OSError:
         return 0
+
+
+async def _stop_process(process: asyncio.subprocess.Process | None) -> None:
+    """在超时或取消时终止 ffmpeg，并把管道里的剩余输出消费掉。"""
+    if process is None or process.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError, OSError):
+        process.kill()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await process.communicate()

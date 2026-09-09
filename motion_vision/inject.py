@@ -92,6 +92,10 @@ def inject(
         if label:
             add(_text(label))
 
+        if result.item.context_text:
+            add(_text(result.item.context_text))
+            report.transcripts += 1
+
         if result.frames:
             if keep:
                 _image_urls(request).extend(str(frame.path) for frame in result.frames)
@@ -134,7 +138,7 @@ def inject(
 
 def describe(result: MediaResult) -> str:
     """一句话交代这个媒体的规格，让模型知道时间跨度有多大。"""
-    if not result.frames:
+    if not result.frames and not result.item.context_text:
         return ""
 
     name = result.item.display_name
@@ -145,7 +149,8 @@ def describe(result: MediaResult) -> str:
         pieces.append(f"时长约 {format_duration(result.duration)}")
     if result.kind is MediaKind.ANIMATION and result.source_frame_count:
         pieces.append(f"源共 {result.source_frame_count} 帧")
-    pieces.append(f"取样 {len(result.frames)} 帧")
+    if result.frames:
+        pieces.append(f"取样 {len(result.frames)} 帧")
 
     density = _density(result)
     if density:
@@ -156,6 +161,8 @@ def describe(result: MediaResult) -> str:
         pieces.append(f"对应时间点 {stamps}")
 
     kind = "动图" if result.kind is MediaKind.ANIMATION else "视频"
+    if not pieces:
+        pieces.append("已取得文字资料")
     return f"{source}{kind}《{name}》：" + "，".join(pieces) + "。"
 
 

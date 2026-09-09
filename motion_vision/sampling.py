@@ -13,7 +13,13 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .settings import HARD_MAX_FRAMES_PER_MEDIA, MB, DetailPreset
+from .settings import (
+    HARD_MAX_ANIMATION_FRAMES,
+    HARD_MAX_FRAMES_PER_MEDIA,
+    HARD_MAX_VIDEO_FRAMES,
+    MB,
+    DetailPreset,
+)
 
 SINGLE_PASS_MAX_SECONDS = 120.0
 """不超过这个时长就整片顺序解码一次取帧。"""
@@ -100,29 +106,38 @@ def animation_frame_budget(
     if total_frames <= 1:
         return min(1, max(total_frames, 0))
 
-    ceiling = min(preset.max_animation_frames, HARD_MAX_FRAMES_PER_MEDIA, total_frames)
+    ceiling = min(
+        preset.max_animation_frames,
+        HARD_MAX_ANIMATION_FRAMES,
+        HARD_MAX_FRAMES_PER_MEDIA,
+        total_frames,
+    )
     floor = min(preset.min_animation_frames, ceiling)
 
     if override > 0:
-        target = min(override, HARD_MAX_FRAMES_PER_MEDIA, total_frames)
+        target = min(override, HARD_MAX_ANIMATION_FRAMES, HARD_MAX_FRAMES_PER_MEDIA, total_frames)
     else:
         seconds = duration if duration and duration > 0 else total_frames / ASSUMED_ANIMATION_FPS
         wanted = math.ceil(seconds / max(preset.animation_seconds_per_frame, 0.05))
         target = max(floor, min(wanted, ceiling))
 
-    if total_frames <= 4:
+    if total_frames <= 4 and override <= 0:
         target = min(target, 3)
     target = _shrink_for_size(target, size_bytes)
 
+    if override > 0:
+        # 手动写 1 是有意义的：有些服务商一次只接受一张图片。自动档位
+        # 仍保持至少两帧，但不应覆盖用户明确给出的值。
+        return max(1, min(target, total_frames))
     return max(MIN_ANIMATION_FRAMES, min(target, total_frames))
 
 
 def _shrink_for_size(target: int, size_bytes: int) -> int:
     """大文件按比例减帧：固定减 1~2 帧对 30 帧的预算等于没减。"""
     if size_bytes >= 10 * MB:
-        return round(target * 0.5)
+        return max(1, round(target * 0.5))
     if size_bytes >= 5 * MB:
-        return round(target * 0.75)
+        return max(1, round(target * 0.75))
     return target
 
 
@@ -133,9 +148,9 @@ def video_frame_budget(duration: float | None, preset: DetailPreset, override: i
     这一个笼统的档位，让 1 分钟和 2 小时的视频得到完全一样的待遇。
     """
     if override > 0:
-        return min(override, HARD_MAX_FRAMES_PER_MEDIA)
+        return min(override, HARD_MAX_VIDEO_FRAMES, HARD_MAX_FRAMES_PER_MEDIA)
 
-    ceiling = min(preset.max_video_frames, HARD_MAX_FRAMES_PER_MEDIA)
+    ceiling = min(preset.max_video_frames, HARD_MAX_VIDEO_FRAMES, HARD_MAX_FRAMES_PER_MEDIA)
     floor = min(preset.min_video_frames, ceiling)
 
     if duration is None or duration <= 0:

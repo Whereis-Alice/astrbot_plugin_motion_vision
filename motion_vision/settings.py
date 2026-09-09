@@ -6,6 +6,7 @@ WebUI 里只暴露少量按模块分组的选项，具体的画质/帧数等数�
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,6 +14,12 @@ MB = 1024 * 1024
 
 HARD_MAX_FRAMES_PER_MEDIA = 64
 """单个媒体的绝对帧数上限，防止配置写飞。"""
+
+HARD_MAX_ANIMATION_FRAMES = 64
+"""动图单独的安全上限。高帧率 GIF 也可能很长，不能无限展开。"""
+
+HARD_MAX_VIDEO_FRAMES = 64
+"""视频单独的安全上限，避免一次请求产生失控的图片数量。"""
 
 
 @dataclass(frozen=True)
@@ -135,6 +142,21 @@ class ReviewSettings:
 
 
 @dataclass(frozen=True)
+class BilibiliSettings:
+    enabled: bool = True
+    """是否识别消息里的 B 站视频链接和引用卡片。"""
+
+    fetch_subtitles: bool = True
+    """是否把 B 站官方/AI 字幕作为文字资料附给模型。"""
+
+    cookie: str = ""
+    """可选的 B 站 Cookie 文本，用于获取需要登录才能看到的字幕。"""
+
+    max_subtitle_chars: int = 12000
+    """单个视频最多注入多少字幕字符。"""
+
+
+@dataclass(frozen=True)
 class AdvancedSettings:
     ffmpeg_path: str = ""
     max_images_per_request: int = 48
@@ -155,6 +177,7 @@ class Settings:
     audio: AudioSettings = field(default_factory=AudioSettings)
     injection: InjectionSettings = field(default_factory=InjectionSettings)
     review: ReviewSettings = field(default_factory=ReviewSettings)
+    bilibili: BilibiliSettings = field(default_factory=BilibiliSettings)
     advanced: AdvancedSettings = field(default_factory=AdvancedSettings)
 
     @property
@@ -163,11 +186,27 @@ class Settings:
 
     @property
     def cache_signature(self) -> str:
-        """影响抽帧产物的配置指纹，用于缓存键。"""
+        """影响抽帧/音频/转写产物的配置指纹，用于缓存键。"""
         preset = self.preset
+        if self.audio.transcribe:
+            backend_fingerprint = hashlib.sha1(
+                "|".join(
+                    (
+                        self.audio.stt_provider_id,
+                        self.audio.api_base,
+                        self.audio.api_key,
+                        self.audio.model,
+                        str(self.audio.max_transcript_chars),
+                    )
+                ).encode("utf-8"),
+                usedforsecurity=False,
+            ).hexdigest()[:12]
+        else:
+            backend_fingerprint = "-"
         return (
             f"{preset.name}:{self.animation_frames_override}:{self.video_frames_override}"
             f":{preset.max_side}:{preset.jpeg_quality}:{self.audio.mode}"
+            f":stt-{backend_fingerprint}"
         )
 
 
@@ -233,6 +272,7 @@ def load_settings(config: Any) -> Settings:
     audio = _section(raw, "audio")
     injection = _section(raw, "injection")
     review = _section(raw, "review")
+    bilibili = _section(raw, "bilibili")
     advanced = _section(raw, "advanced")
 
     # 0.2.x 只有一个共用的 frames_override，升级上来时沿用它当两边的初值。
@@ -250,13 +290,13 @@ def load_settings(config: Any) -> Settings:
             sampling.get("animation_frames_override", legacy_override),
             0,
             0,
-            HARD_MAX_FRAMES_PER_MEDIA,
+            HARD_MAX_ANIMATION_FRAMES,
         ),
         video_frames_override=_as_int(
             sampling.get("video_frames_override", legacy_override),
             0,
             0,
-            HARD_MAX_FRAMES_PER_MEDIA,
+            HARD_MAX_VIDEO_FRAMES,
         ),
         animation=AnimationSettings(
             enabled=_as_bool(animation.get("enabled"), True),
@@ -282,6 +322,12 @@ def load_settings(config: Any) -> Settings:
         ),
         review=ReviewSettings(
             enabled=_as_bool(review.get("enabled"), True),
+        ),
+        bilibili=BilibiliSettings(
+            enabled=_as_bool(bilibili.get("enabled"), True),
+            fetch_subtitles=_as_bool(bilibili.get("fetch_subtitles"), True),
+            cookie=_as_str(bilibili.get("cookie")),
+            max_subtitle_chars=_as_int(bilibili.get("max_subtitle_chars"), 12000, 500, 50000),
         ),
         advanced=AdvancedSettings(
             ffmpeg_path=_as_str(advanced.get("ffmpeg_path")),
