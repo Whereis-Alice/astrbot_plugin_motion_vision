@@ -139,6 +139,8 @@ class MediaResult:
     """可选的整片原生视频模型报告。它是外部证据，不是当前模型的指令。"""
     notice: str = ""
     """处理失败或被降级时给模型看的中文说明。"""
+    budget_dropped_frames: int = 0
+    """本轮预算移除的帧数；全部移除时也要清理原始附件，避免绕过预算。"""
 
     @property
     def kind(self) -> MediaKind:

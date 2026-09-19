@@ -6,11 +6,13 @@ import dataclasses
 from pathlib import Path
 from typing import Any
 
+import pytest
 from astrbot.core.agent.message import TextPart
 
 from motion_vision.inject import FALLBACK_PROMPT, HEADER, inject
 from motion_vision.models import AudioClip, MediaItem, MediaKind, MediaResult, SampledFrame
-from motion_vision.settings import InjectionSettings, Settings
+from motion_vision.pipeline import MediaPipeline
+from motion_vision.settings import AdvancedSettings, InjectionSettings, Settings
 
 
 class FakeRequest:
@@ -110,6 +112,36 @@ def test_original_image_is_dropped_from_request(tmp_path: Path) -> None:
     inject(request, [result], _settings())
 
     assert request.image_urls == ["keep-me.png"]
+
+
+@pytest.mark.parametrize("notice_enabled", [True, False])
+def test_budget_dropped_gif_cannot_bypass_limit_as_original(tmp_path: Path, notice_enabled) -> None:
+    request = FakeRequest(image_urls=["keep.png", "original.gif"])
+    gif = _result(tmp_path, frames=3, kind=MediaKind.ANIMATION, image_url_index=1)
+    video = _result(tmp_path, frames=4, quoted=True)
+    settings = dataclasses.replace(
+        _settings(notice_enabled=notice_enabled),
+        advanced=AdvancedSettings(max_images_per_request=1),
+    )
+    pipeline = MediaPipeline(settings, None, None, None, None, None, None)
+    pipeline._apply_payload_budget([gif, video])
+
+    report = inject(request, [gif, video], settings)
+
+    assert not gif.frames
+    assert request.image_urls == ["keep.png"]
+    assert report.frames == len(_images(request)) == 1
+    assert any("引用消息里的视频" in text for text in _texts(request))
+
+
+def test_all_frames_omitted_still_removes_original_with_notices_off(tmp_path: Path) -> None:
+    request = FakeRequest(image_urls=["original.gif"])
+    result = _result(
+        tmp_path, frames=0, kind=MediaKind.ANIMATION, image_url_index=0, budget_dropped_frames=3
+    )
+    inject(request, [result], _settings(notice_enabled=False))
+    assert request.image_urls == []
+    assert _images(request) == []
 
 
 def test_marker_is_stripped_from_prompt_part(tmp_path: Path) -> None:

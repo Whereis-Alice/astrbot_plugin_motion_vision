@@ -2,7 +2,7 @@ name: astrbot_plugin_motion_vision
 display_name: 动态视觉 Motion Vision
 desc: 让大模型拥有眼睛：理解动图、视频、B 站资料和引用卡片，并可选调用整片视频模型。
 short_desc: 让大模型拥有眼睛，读懂动图和视频
-version: 0.6.0
+version: 0.6.1
 author: Whereis-Alice
 repo: https://github.com/Whereis-Alice/astrbot_plugin_motion_vision
 astrbot_version: ">=4.16,<5"

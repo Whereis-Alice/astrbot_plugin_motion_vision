@@ -89,7 +89,7 @@ MEDIA_LIST_TOOL_NAME = "list_motion_media"
     PLUGIN_NAME,
     "Whereis-Alice",
     "让大模型读懂动图和视频：自动抽取关键帧、可选提取语音，再连同说明一起交给模型。",
-    "0.6.0",
+    "0.6.1",
     "https://github.com/Whereis-Alice/astrbot_plugin_motion_vision",
 )
 class MotionVisionPlugin(Star):

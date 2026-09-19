@@ -397,12 +397,14 @@
       "max_images_per_request": {
         "description": "单轮最多送出几张画面",
         "type": "int",
-        "default": 48
+        "default": 48,
+        "hint": "混合消息优先满足视频取帧目标，剩余额度在动图间均分；预算允许时每张动图预留 2 帧。"
       },
       "max_frame_payload_mb": {
         "description": "单轮画面总体积上限（MB）",
         "type": "int",
-        "default": 20
+        "default": 20,
+        "hint": "抽帧图片的合计体积限制；超限时同样优先保留视频画面。"
       },
       "max_seconds_per_video": {
         "description": "单个视频最长处理时间（秒）",

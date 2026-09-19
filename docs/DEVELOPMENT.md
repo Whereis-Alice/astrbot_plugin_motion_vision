@@ -11,7 +11,7 @@ python -m pip install pytest ruff
 python -m pytest -q
 python -m ruff check .
 python -m ruff format --check .
-python -m py_compile main.py motion_vision/*.py motion_vision/sources/*.py
+python -m compileall -q main.py motion_vision
 ```
 
 如果要在本地运行 AstrBot，请按 AstrBot 的开发文档准备宿主环境；插件本身不把宿主的配置、凭据或临时文件提交到仓库。
@@ -28,6 +28,7 @@ motion_vision/
   settings.py             配置读取、归一化和安全限幅
   models.py               媒体、帧、音频和外部证据模型
   sampling.py             动图/视频取帧规划、长视频窗口和预算分配
+  budget.py               视频优先的张数/体积预算、动图基础帧与同类均分
   animation.py            Pillow 动图解码
   ffmpeg.py               ffmpeg 探测、视频抽帧和音轨提取
   pipeline.py             统一媒体流水线和失败降级
@@ -70,7 +71,9 @@ motion_vision/
 
 ### 预算先行
 
-每个媒体有自己的安全上限，多媒体还共享整轮图片数量和总体积预算。超预算时沿时间轴均匀抽稀，不把片尾整段丢掉。
+每个媒体有自己的安全上限，多媒体还共享整轮抽帧图片数量和总体积预算。混合消息优先满足视频目标，剩余额度在动图之间均分；预算足够时，每张动图先预留最多两帧。同类媒体按需求均分，只有动图的消息不受视频优先规则影响。
+
+体积按最终均匀取样后的实际帧大小核算，不能假设每张图片大小相同。张数与体积一并规划后，再从原始时间轴抽稀一次；原始缓存不受本轮裁剪影响。帧被预算全部裁掉时，也要移除对应的原始附件，避免它绕过预算再次进入请求。
 
 ### 并发受控
 

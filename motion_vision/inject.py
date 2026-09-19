@@ -80,11 +80,16 @@ def inject(
     notices = [result for result in results if result.notice] if _notices_on(settings) else []
     usable_evidence = [item for item in evidence if item.text or item.images]
 
+    # 已经解码但被预算全部裁掉的动图也要摘掉原图，否则原始 GIF 会从
+    # image_urls 绕过预算进入模型。真正解析失败的附件仍保留原有行为。
+    _cleanup_request(
+        request, [result for result in results if result.ok or result.budget_dropped_frames]
+    )
+
     if not usable and not notices and not usable_evidence:
         return report
 
     keep = settings.injection.keep_frames_in_history
-    _cleanup_request(request, usable)
 
     parts: list[Any] = _ensure_parts(request)
     add = _appender(parts, temporary=not keep)

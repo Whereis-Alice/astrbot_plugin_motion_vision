@@ -17,8 +17,8 @@ def _pipeline(**advanced: object) -> MediaPipeline:
     return MediaPipeline(settings, None, None, None, None, None, None)
 
 
-def _result(name: str, count: int, size: int) -> MediaResult:
-    item = MediaItem(kind=MediaKind.VIDEO, name=name, identity=name)
+def _result(name: str, count: int, size: int, kind: MediaKind = MediaKind.VIDEO) -> MediaResult:
+    item = MediaItem(kind=kind, name=name, identity=name)
     frames = [
         SampledFrame(path=Path(f"{name}-{index}.jpg"), index=index, size_bytes=size)
         for index in range(count)
@@ -41,7 +41,8 @@ def test_frame_count_budget_is_shared_fairly() -> None:
 
 def test_budget_leftovers_go_to_whoever_still_needs_them() -> None:
     pipeline = _pipeline(max_images_per_request=10)
-    small, big = _result("a.gif", 2, 1024), _result("b.mp4", 20, 1024)
+    small = _result("a.gif", 2, 1024, MediaKind.ANIMATION)
+    big = _result("b.mp4", 20, 1024)
 
     pipeline._apply_payload_budget([small, big])
 
@@ -105,6 +106,37 @@ def test_generous_budget_changes_nothing() -> None:
 
     assert len(result.frames) == 8
     assert result.notice == ""
+
+
+def test_quoted_video_keeps_target_alongside_three_gifs() -> None:
+    pipeline = _pipeline()
+    gifs = [_result(f"{i}.gif", 30, 1024, MediaKind.ANIMATION) for i in range(3)]
+    video = _result("quoted.mp4", 30, 1024)
+    video.item.quoted = True
+    original_frames = gifs[0].frames
+    results = [*gifs, video]
+
+    pipeline._apply_payload_budget(results)
+
+    assert [len(result.frames) for result in results] == [6, 6, 6, 30]
+    assert len(original_frames) == 30  # 不修改抽帧缓存持有的列表
+    assert video.notice == ""
+    assert video.item.quoted
+    assert all(result.budget_dropped_frames == 24 for result in gifs)
+    assert all(result.frames[-1].path.name.endswith("-29.jpg") for result in gifs)
+
+
+def test_final_frame_selection_is_uniform_on_original_timeline() -> None:
+    pipeline = _pipeline(max_images_per_request=4, max_frame_payload_mb=1)
+    result = _result("a.mp4", 9, MB // 3)
+
+    pipeline._apply_payload_budget([result])
+
+    assert [frame.path.name for frame in result.frames] == [
+        "a.mp4-0.jpg",
+        "a.mp4-4.jpg",
+        "a.mp4-8.jpg",
+    ]
 
 
 def test_text_only_video_source_does_not_report_missing_file() -> None:
