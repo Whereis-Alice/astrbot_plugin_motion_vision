@@ -178,12 +178,17 @@ async def peek_head(
 ) -> bytes:
     """用 Range 请求只取文件头，避免为了判类型下载整个文件。"""
     try:
-        response = await client.get(
-            url, headers={"Range": f"bytes=0-{max(0, nbytes - 1)}"}, timeout=timeout
-        )
-        if response.status_code >= 400:
-            return b""
-        return response.content[:nbytes]
+        async with client.stream(
+            "GET", url, headers={"Range": f"bytes=0-{max(0, nbytes - 1)}"}, timeout=timeout
+        ) as response:
+            if response.status_code >= 400:
+                return b""
+            head = bytearray()
+            async for chunk in response.aiter_bytes(chunk_size=nbytes):
+                head.extend(chunk[: nbytes - len(head)])
+                if len(head) >= nbytes:
+                    break
+            return bytes(head)
     except (httpx.HTTPError, ValueError):
         return b""
 

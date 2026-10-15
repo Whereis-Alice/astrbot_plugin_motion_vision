@@ -14,7 +14,11 @@
         "description": "细节档位",
         "type": "string",
         "default": "均衡",
-        "options": ["节省", "均衡", "精细"],
+        "options": [
+          "节省",
+          "均衡",
+          "精细"
+        ],
         "hint": "节省：视频约每 8 秒一帧；均衡：约每 3 秒一帧；精细：约每 1.5 秒一帧。长视频会触及档位上限。"
       },
       "animation_frames_override": {
@@ -39,7 +43,7 @@
         "description": "解析动图",
         "type": "bool",
         "default": true,
-        "hint": "识别动态图片并按时间顺序拆成静态帧。"
+        "hint": "识别图片、文件附件、群文件和引用消息中的动态图片；静态图片保持原样。"
       }
     }
   },
@@ -82,7 +86,12 @@
         "description": "声音处理方式",
         "type": "string",
         "default": "关闭",
-        "options": ["关闭", "附带音轨", "转写文字", "音轨和文字"]
+        "options": [
+          "关闭",
+          "附带音轨",
+          "转写文字",
+          "音轨和文字"
+        ]
       },
       "stt_provider_id": {
         "description": "语音识别服务商",
@@ -135,14 +144,21 @@
         "description": "字幕语言偏好",
         "type": "string",
         "default": "auto",
-        "options": ["自动", "中文", "英文"],
+        "options": [
+          "自动",
+          "中文",
+          "英文"
+        ],
         "hint": "也可以直接填写 B 站语言代码。"
       },
       "subtitle_fallback": {
         "description": "官方字幕缺失时的回退",
         "type": "string",
         "default": "关闭",
-        "options": ["关闭", "必剪转写"],
+        "options": [
+          "关闭",
+          "必剪转写"
+        ],
         "hint": "必剪回退需要 ffmpeg，并会把视频音频上传到 B 站必剪服务；只在官方字幕没有结果时使用。"
       },
       "max_subtitle_chars": {
@@ -250,14 +266,24 @@
         "description": "整片分析模式",
         "type": "string",
         "default": "关闭",
-        "options": ["关闭", "自动", "按需"],
+        "options": [
+          "关闭",
+          "自动",
+          "按需"
+        ],
         "hint": "自动：每条消息最多自动分析少量视频；按需：只在模型调用 analyze_motion_video 工具时上传。"
       },
       "provider": {
         "description": "视频模型协议",
         "type": "string",
         "default": "自动判断",
-        "options": ["自动判断", "Gemini", "OpenAI 兼容", "通义千问", "Kimi"],
+        "options": [
+          "自动判断",
+          "Gemini",
+          "OpenAI 兼容",
+          "通义千问",
+          "Kimi"
+        ],
         "hint": "自动根据 API 地址和模型名判断；不确定时建议手动选择。"
       },
       "api_key": {
@@ -368,6 +394,16 @@
         "type": "text",
         "default": "",
         "hint": "例如：重点描述人物动作、屏幕文字或镜头变化。"
+      },
+      "frame_layout": {
+        "description": "画面提交方式",
+        "type": "string",
+        "default": "独立帧",
+        "options": [
+          "独立帧",
+          "小宫格"
+        ],
+        "hint": "默认独立帧保留细节。图片数量受限的接口可选小宫格，每页最多 4 帧，带时间戳；可能被模型缩图，不保证更省 token。单轮张数按实际送出的图片计，体积仍核算实际文件。"
       }
     }
   },
@@ -428,8 +464,14 @@
     "type": "object",
     "invisible": true,
     "items": {
-      "sessdata": {"type": "string", "default": ""},
-      "bili_jct": {"type": "string", "default": ""}
+      "sessdata": {
+        "type": "string",
+        "default": ""
+      },
+      "bili_jct": {
+        "type": "string",
+        "default": ""
+      }
     }
   }
 }

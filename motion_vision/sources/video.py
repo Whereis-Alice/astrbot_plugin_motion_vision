@@ -13,9 +13,11 @@ QQ 的视频有很多种到达方式，因此按可靠性从高到低逐层降�
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,7 @@ from .common import (
     is_http_url,
     looks_like_video,
     parse_markers,
+    peek_head,
     redact_url,
     resolve_local_path,
 )
@@ -93,6 +96,8 @@ class VideoCollector:
         max_download_mb: int = 100,
         include_group_files: bool = True,
         search_dirs: tuple[Path, ...] = (),
+        media_kind: MediaKind = MediaKind.VIDEO,
+        media_predicate: Callable[[str, str], bool] = looks_like_video,
     ) -> None:
         self.request = request
         self.event = event
@@ -102,6 +107,8 @@ class VideoCollector:
         self.max_download_bytes = max(1, max_download_mb) * MB
         self.include_group_files = include_group_files
         self.search_dirs = search_dirs
+        self.media_kind = media_kind
+        self._accepts = media_predicate
         self._seen: set[str] = set()
         self._seen_paths: set[str] = set()
 
@@ -148,7 +155,9 @@ class VideoCollector:
             for marker in parse_markers(text, part_index):
                 if marker.kind == "image":
                     continue
-                if marker.kind == "file" and not looks_like_video(marker.name):
+                if self.media_kind is MediaKind.ANIMATION and marker.kind != "file":
+                    continue
+                if marker.kind == "file" and not self._accepts(marker.name, ""):
                     continue
                 found.append(
                     VideoCandidate(
@@ -178,7 +187,7 @@ class VideoCollector:
 
         def handle(component: Any, bucket: list[VideoCandidate], is_quoted: bool) -> None:
             if isinstance(component, AstrVideo):
-                if skip_video_components:
+                if skip_video_components or self.media_kind is MediaKind.ANIMATION:
                     return
                 values = [
                     str(getattr(component, name, "") or "") for name in ("path", "file", "url")
@@ -206,9 +215,9 @@ class VideoCollector:
                 )
                 url = str(getattr(component, "url", "") or "")
                 if (
-                    not looks_like_video(name, str(getattr(component, "mime", "") or ""))
-                    and not looks_like_video(raw)
-                    and not looks_like_video(url)
+                    not self._accepts(name, str(getattr(component, "mime", "") or ""))
+                    and not self._accepts(raw, "")
+                    and not self._accepts(url, "")
                 ):
                     return
                 bucket.append(
@@ -292,7 +301,8 @@ class VideoCollector:
         if not isinstance(segment, dict):
             return None
         seg_type = str(segment.get("type") or "").lower()
-        if seg_type not in ("file", "video"):
+        allowed = ("file", "image") if self.media_kind is MediaKind.ANIMATION else ("file", "video")
+        if seg_type not in allowed:
             return None
         data = segment.get("data")
         if not isinstance(data, dict):
@@ -300,11 +310,13 @@ class VideoCollector:
 
         name = str(data.get("file_name") or data.get("name") or data.get("file") or "")
         mime = str(data.get("mime") or data.get("mime_type") or data.get("content_type") or "")
-        if seg_type == "file" and not looks_like_video(name, mime):
+        if seg_type == "file" and not self._accepts(name, mime):
             return None
 
         raw = str(data.get("path") or data.get("file") or "")
         url = str(data.get("url") or data.get("download_url") or "")
+        if not url and is_http_url(raw):
+            url = raw
         return VideoCandidate(
             name=Path(name).name or "视频",
             raw_path="" if is_http_url(raw) else raw,
@@ -325,7 +337,10 @@ class VideoCollector:
                 return None
             return self._make_item(candidate, local, owned=False)
 
-        component_path, component_url = await self._ask_component(candidate)
+        # 已有直链时走有界下载，别让组件的内部下载绕过体积限制。
+        component_path, component_url = (
+            (None, "") if candidate.url else await self._ask_component(candidate)
+        )
         if component_path is not None:
             if self._path_seen(component_path):
                 return None
@@ -338,6 +353,12 @@ class VideoCollector:
         if not url:
             result.notices.append((label, "没能拿到可下载的文件地址"))
             return None
+
+        if self.media_kind is MediaKind.ANIMATION:
+            from ..animation import HEAD_BYTES, maybe_animated
+
+            if not maybe_animated(await peek_head(self.client, url, HEAD_BYTES)):
+                return None
 
         dest = self._download_path(Path(candidate.name or "video").suffix or ".mp4")
         try:
@@ -364,10 +385,10 @@ class VideoCollector:
         getter = getattr(component, "get_file", None)
         if callable(getter):
             try:
-                raw = await getter(allow_return_url=True)
+                raw = await asyncio.wait_for(getter(allow_return_url=True), timeout=30.0)
             except TypeError:
                 try:
-                    raw = await getter()
+                    raw = await asyncio.wait_for(getter(), timeout=30.0)
                 except Exception:
                     raw = ""
             except Exception:
@@ -376,7 +397,7 @@ class VideoCollector:
             converter = getattr(component, "convert_to_file_path", None)
             if callable(converter):
                 try:
-                    raw = await converter()
+                    raw = await asyncio.wait_for(converter(), timeout=30.0)
                 except Exception:
                     raw = ""
 
@@ -436,7 +457,7 @@ class VideoCollector:
         if call is None:
             return None
         try:
-            response = await call(action, **params)
+            response = await asyncio.wait_for(call(action, **params), timeout=20.0)
         except Exception:
             return None
         if isinstance(response, dict):
@@ -473,7 +494,7 @@ class VideoCollector:
         self._seen.add(identity)
         self._seen_paths.add(str(path).casefold())
         return MediaItem(
-            kind=MediaKind.VIDEO,
+            kind=self.media_kind,
             name=candidate.name or path.name,
             identity=identity,
             path=path,
@@ -499,7 +520,7 @@ def _raw_segments(raw: Any) -> list[Any]:
                 segments = _raw_segments(value)
                 if segments:
                     return segments
-        if str(raw.get("type") or "").casefold() in {"file", "video", "reply"}:
+        if str(raw.get("type") or "").casefold() in {"file", "video", "reply", "image"}:
             return [raw]
         return []
     if isinstance(raw, (list, tuple)):

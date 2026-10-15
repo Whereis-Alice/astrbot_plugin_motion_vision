@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import re
 import shutil
 import subprocess
@@ -61,6 +62,9 @@ class ProbeResult:
     has_audio: bool = False
     width: int = 0
     height: int = 0
+    video_start: float = 0.0
+    audio_start: float = 0.0
+    timing_known: bool = False
 
 
 def _resolve_explicit(raw: str) -> FfmpegTools | None:
@@ -321,8 +325,13 @@ class FfmpegRunner:
         out_path: Path,
         seconds: float,
         timeout: float = 120.0,
+        *,
+        channels: int = 1,
+        sample_rate: int = 16000,
+        start_seconds: float = 0.0,
+        audio_offset: float = 0.0,
     ) -> AudioClip:
-        """导出 16kHz 单声道 WAV —— 主流 STT 服务最通吃的格式。"""
+        """导出 PCM WAV。原音用双声道，STT 单声道；裁剪/补静音对齐视频时间轴。"""
         if not self.tools.ffmpeg:
             raise FfmpegError("ffmpeg 不可用，无法提取音轨")
 
@@ -335,12 +344,24 @@ class FfmpegRunner:
             "-y",
             "-i",
             str(path),
+            "-map",
+            "0:a:0",
             "-vn",
             "-ac",
-            "1",
+            str(channels),
             "-ar",
-            "16000",
+            str(sample_rate),
+            "-c:a",
+            "pcm_s16le",
         ]
+        trim = max(0.0, start_seconds - audio_offset)
+        padding = max(0.0, audio_offset - start_seconds)
+        filters = f"asetpts=PTS-STARTPTS,atrim=start={trim:.6f},asetpts=PTS-STARTPTS"
+        if padding > 0:
+            filters += f",adelay={round(padding * 1000)}:all=1"
+        if seconds > 0:
+            filters += ",apad"
+        args += ["-af", filters]
         if seconds > 0:
             args += ["-t", f"{seconds:.3f}"]
         args += ["-f", "wav", str(out_path)]
@@ -348,7 +369,7 @@ class FfmpegRunner:
         result = await self._run(args, timeout)
         if result.returncode != 0 or not out_path.exists() or _size_of(out_path) < 1024:
             raise FfmpegError("音轨提取失败，这个视频可能没有声音")
-        return AudioClip(path=out_path, seconds=seconds)
+        return AudioClip(path=out_path, seconds=seconds, start_seconds=start_seconds)
 
     async def compress_video(
         self,
@@ -416,15 +437,24 @@ def _parse_ffprobe(payload: str) -> ProbeResult | None:
     streams = data.get("streams") or []
     fmt = data.get("format") or {}
 
-    duration: float | None = None
-    for source in (fmt.get("duration"), *(s.get("duration") for s in streams)):
+    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
+
+    def number(raw: object) -> float | None:
         try:
-            value = float(source)
+            value = float(raw)
+            return value if math.isfinite(value) else None
         except (TypeError, ValueError):
-            continue
-        if value > 0:
-            duration = value
-            break
+            return None
+
+    duration = next(
+        (
+            value
+            for raw in (video.get("duration"), fmt.get("duration"), audio.get("duration"))
+            if (value := number(raw)) is not None and value > 0
+        ),
+        None,
+    )
 
     width = height = 0
     has_video = has_audio = False
@@ -443,6 +473,10 @@ def _parse_ffprobe(payload: str) -> ProbeResult | None:
         has_audio=has_audio,
         width=width,
         height=height,
+        video_start=number(video.get("start_time")) or 0.0,
+        audio_start=number(audio.get("start_time")) or 0.0,
+        timing_known=number(video.get("start_time")) is not None
+        and number(audio.get("start_time")) is not None,
     )
 
 

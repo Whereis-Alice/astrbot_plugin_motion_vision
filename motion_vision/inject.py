@@ -21,11 +21,12 @@ import contextlib
 from dataclasses import dataclass
 from typing import Any
 
+from .host_images import part_image_ref
 from .models import ContextEvidence, MediaKind, MediaResult, SampledFrame, format_duration
 from .settings import Settings
 
 HEADER = (
-    "【动态媒体解析】下面的图片是从用户发来的动图或视频里按时间顺序抽取的关键帧，"
+    "【动态媒体解析】下面的图片是从用户发来的动图或视频里按时间顺序抽取的采样帧，"
     "它们属于同一段画面的连续采样，不是多张互不相关的图片。"
     "请综合这些帧理解画面内容和动作变化，像正常看过这段内容一样回答，"
     "不要逐帧罗列，也不必提到抽帧、关键帧之类的技术细节。"
@@ -108,9 +109,9 @@ def inject(
 
         if result.frames:
             if keep:
-                _image_urls(request).extend(str(frame.path) for frame in result.frames)
+                _image_urls(request).extend(str(frame.path) for frame in result.images)
             else:
-                for frame in result.frames:
+                for frame in result.images:
                     add(_image(frame, result))
             report.frames += len(result.frames)
 
@@ -125,6 +126,22 @@ def inject(
         if result.audio is not None:
             _audio_urls(request).append(str(result.audio.path))
             report.audio += 1
+            number = len(_audio_urls(request))
+            start = result.audio.start_seconds
+            add(
+                _text(
+                    f"【音画对应】本轮第 {number} 个音频附件对应媒体 "
+                    f"{result.item.media_id or report.media + 1}《{result.item.display_name}》，"
+                    f"覆盖视频 {start:.2f}s 起约 {result.audio.seconds:.1f} 秒。"
+                    + (
+                        "音画起点已对齐。"
+                        if result.audio_status == "ready"
+                        else "源轨道起点信息不完整，音画同步精度无法确认。"
+                    )
+                )
+            )
+        if fact := describe_audio(result):
+            add(_text(fact))
 
         report.media += 1
 
@@ -164,7 +181,7 @@ def inject(
 
 def describe(result: MediaResult) -> str:
     """一句话交代这个媒体的规格，让模型知道时间跨度有多大。"""
-    if not result.frames and not result.item.context_text and not result.native_report:
+    if not result.ok:
         return ""
 
     name = result.item.display_name
@@ -177,6 +194,12 @@ def describe(result: MediaResult) -> str:
         pieces.append(f"源共 {result.source_frame_count} 帧")
     if result.frames:
         pieces.append(f"取样 {len(result.frames)} 帧")
+        if result.sheets:
+            pieces.append(
+                f"分成 {len(result.sheets)} 张小宫格，每页从左到右、从上到下阅读，空格不是额外帧"
+            )
+    if result.item.media_id:
+        pieces.append(f"媒体编号 {result.item.media_id}")
 
     density = _density(result)
     if density:
@@ -196,6 +219,20 @@ def describe_transcript(result: MediaResult) -> str:
     return (
         f"《{result.item.display_name}》里的语音内容（机器转写，可能有错字）：{result.transcript}"
     )
+
+
+def describe_audio(result: MediaResult) -> str:
+    facts = {
+        "no_track": "源文件没有音轨。",
+        "off": "音轨处理未开启，当前只提供画面或文字，不能据此确认声音。",
+        "unsupported": "当前对话模型未声明支持音频，未附带原音；语音以实际提供的转写为准。",
+        "silent": "所读取的音轨片段完全静音，不代表未读取的其余片段也静音。",
+        "timeout": "处理时间不足，未读取音轨。",
+        "failed": "音轨读取失败。",
+        "transcribe_only": "未附带原音；机器转写只提供语音文字，不能代替音乐、音效或音色情报。",
+    }
+    fact = facts.get(result.audio_status, "")
+    return f"【声音状态｜{result.item.display_name}】{fact}" if fact else ""
 
 
 def describe_native_report(result: MediaResult) -> str:
@@ -232,17 +269,14 @@ def _cleanup_request(request: Any, usable: list[MediaResult]) -> None:
 
 def _drop_original_images(request: Any, usable: list[MediaResult]) -> None:
     urls = _image_urls(request)
-    indexes = sorted(
-        {
-            result.item.image_url_index
-            for result in usable
-            if result.item.image_url_index is not None
-        },
-        reverse=True,
-    )
-    for index in indexes:
-        if 0 <= index < len(urls):
-            del urls[index]
+    indexes = {
+        result.item.image_url_index for result in usable if result.item.image_url_index is not None
+    }
+    refs = {ref for result in usable for ref in result.item.original_image_refs}
+    urls[:] = [url for i, url in enumerate(urls) if i not in indexes and url not in refs]
+    parts = getattr(request, "extra_user_content_parts", None)
+    if isinstance(parts, list) and refs:
+        parts[:] = [part for part in parts if part_image_ref(part) not in refs]
 
 
 def _strip_markers(request: Any, usable: list[MediaResult]) -> None:
@@ -251,29 +285,37 @@ def _strip_markers(request: Any, usable: list[MediaResult]) -> None:
         return
 
     dirty = False
-    for result in usable:
-        item = result.item
-        if item.part_index is None or not item.marker_raw:
+    markers = {
+        marker
+        for result in usable
+        for marker in [result.item.marker_raw, *result.item.original_markers]
+        if marker
+    }
+    # 依照完整标记匹配，不依赖可能被移除图片后改变的 part 下标。
+    for part in parts:
+        text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+        if not isinstance(text, str):
             continue
-        if not 0 <= item.part_index < len(parts):
-            continue
-        part = parts[item.part_index]
-        text = getattr(part, "text", None)
-        if not isinstance(text, str) or item.marker_raw not in text:
-            continue
-        try:
-            part.text = text.replace(item.marker_raw, "").strip()
-        except Exception:
-            continue
-        dirty = True
-
+        cleaned = text
+        for marker in markers:
+            cleaned = cleaned.replace(marker, "")
+        if cleaned != text:
+            if isinstance(part, dict):
+                part["text"] = cleaned.strip()
+            else:
+                part.text = cleaned.strip()
+            dirty = True
     if not dirty:
         return
 
     survivors = [
         part
         for part in parts
-        if getattr(part, "type", "") != "text" or (getattr(part, "text", "") or "").strip()
+        if (
+            (part.get("type") != "text" or (part.get("text", "") or "").strip())
+            if isinstance(part, dict)
+            else (getattr(part, "type", "") != "text" or (getattr(part, "text", "") or "").strip())
+        )
     ]
     if len(survivors) != len(parts):
         parts[:] = survivors
@@ -357,6 +399,8 @@ def _frame_id(frame: SampledFrame, result: MediaResult) -> str:
     stem = result.item.display_name
     if len(stem) > 24:
         stem = stem[:23] + "…"
+    if result.sheets:
+        return f"{stem} 宫格 #{frame.index + 1}（按行阅读）"
     if frame.timestamp is None:
         return f"{stem} #{frame.index + 1}"
     return f"{stem} #{frame.index + 1}@{frame.timestamp:.1f}s"

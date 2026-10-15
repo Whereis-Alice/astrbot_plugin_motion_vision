@@ -121,8 +121,6 @@ def animation_frame_budget(
         wanted = math.ceil(seconds / max(preset.animation_seconds_per_frame, 0.05))
         target = max(floor, min(wanted, ceiling))
 
-    if total_frames <= 4 and override <= 0:
-        target = min(target, 3)
     target = _shrink_for_size(target, size_bytes)
 
     if override > 0:

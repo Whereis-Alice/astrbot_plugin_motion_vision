@@ -133,6 +133,7 @@ class InjectionSettings:
     notice_enabled: bool = True
     keep_frames_in_history: bool = False
     extra_guidance: str = ""
+    frame_layout: str = "individual"
 
 
 @dataclass(frozen=True)
@@ -282,9 +283,11 @@ class Settings:
         else:
             backend_fingerprint = "-"
         return (
-            f"{preset.name}:{self.animation_frames_override}:{self.video_frames_override}"
+            f"timeline-v2:{preset.name}:{self.animation_frames_override}:{self.video_frames_override}"
             f":{preset.max_side}:{preset.jpeg_quality}:{self.audio.mode}"
             f":stt-{backend_fingerprint}"
+            f":layout-{self.injection.frame_layout}"
+            f":native-settings-{hashlib.sha256(repr(self.native_video).encode()).hexdigest()[:16]}"
             f":native-{self.native_video.mode}:{self.native_video.provider}:"
             f"{self.native_video.model}:{self.native_video.max_upload_mb}:"
             f"{self.native_video.inline_mb}:{self.native_video.auto_compress}:"
@@ -443,6 +446,12 @@ def load_settings(config: Any) -> Settings:
             notice_enabled=_as_bool(injection.get("notice_enabled"), True),
             keep_frames_in_history=_as_bool(injection.get("keep_frames_in_history"), False),
             extra_guidance=_as_str(injection.get("extra_guidance")),
+            frame_layout=_as_choice(
+                injection.get("frame_layout"),
+                ("individual", "montage"),
+                "individual",
+                {"独立帧": "individual", "小宫格": "montage"},
+            ),
         ),
         review=ReviewSettings(
             enabled=_as_bool(review.get("enabled"), True),

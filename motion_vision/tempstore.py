@@ -14,10 +14,11 @@ motion_vision 子目录里，按用途再分子目录：
 
 from __future__ import annotations
 
-import shutil
 import time
 import uuid
 from pathlib import Path
+
+from .resources import discard
 
 DIR_NAME = "motion_vision"
 
@@ -54,17 +55,17 @@ class TempStore:
 
     @staticmethod
     def discard(path: Path | str | None) -> None:
-        """安静地删除一个文件或目录，失败不抛。"""
-        if not path:
-            return
-        target = Path(path)
-        try:
-            if target.is_dir():
-                shutil.rmtree(target, ignore_errors=True)
-            else:
-                target.unlink(missing_ok=True)
-        except OSError:
-            pass
+        """安静地删除；仍在使用的文件延迟回收。"""
+        discard(path)
+
+    def clear(self) -> int:
+        """逐项清理，不能把仍有任务使用的整个根目录排入删除队列。"""
+        count = 0
+        for group in ("frames", "audio", "downloads"):
+            for entry in self._iter(self.base / group):
+                self.discard(entry)
+                count += 1
+        return count
 
     def sweep(self, min_interval: float = 300.0) -> int:
         """删除超过保留时长的条目，返回删除数量。

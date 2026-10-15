@@ -172,3 +172,28 @@ def test_video_collector_reads_remote_state_saved_on_message_object() -> None:
     assert candidates[0].name == "quoted.mp4"
     assert candidates[0].url == "https://cdn.example/quoted.mp4"
     assert candidates[0].quoted is True
+
+
+def test_peek_head_does_not_download_a_range_ignoring_server() -> None:
+    import asyncio
+
+    import httpx
+
+    from motion_vision.sources.common import peek_head
+
+    consumed = []
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for i in range(1000):
+                consumed.append(i)
+                yield b"x" * 1024
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=Stream()))
+        ) as client:
+            return await peek_head(client, "https://files.test/huge", 1024)
+
+    assert asyncio.run(scenario()) == b"x" * 1024
+    assert len(consumed) == 1

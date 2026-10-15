@@ -7,13 +7,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .models import AudioClip, SampledFrame
+from .models import AudioClip, FrameSheet, SampledFrame
 
 
 @dataclass
@@ -25,6 +28,9 @@ class CacheEntry:
     native_report: str = ""
     audio: AudioClip | None = None
     notice: str = ""
+    audio_status: str = ""
+    sheets: list[FrameSheet] = field(default_factory=list)
+    sheets_dir: Path | None = None
     frames_dir: Path | None = None
     created_at: float = field(default_factory=time.time)
 
@@ -37,11 +43,30 @@ class ResultCache:
         capacity: int = 24,
         ttl_seconds: float = 3600.0,
         on_evict: Callable[[Path | None], None] | None = None,
+        max_bytes: int = 256 * 1024 * 1024,
     ) -> None:
         self.capacity = max(1, capacity)
         self.ttl_seconds = max(60.0, ttl_seconds)
+        self.max_bytes = max(1, max_bytes)
         self._on_evict = on_evict
         self._store: OrderedDict[str, CacheEntry] = OrderedDict()
+        self._inflight: dict[str, tuple[asyncio.Lock, int]] = {}
+        self._sizes: dict[str, int] = {}
+
+    @asynccontextmanager
+    async def processing(self, key: str) -> AsyncIterator[None]:
+        """相同内容只生成一次；等待者随后重新检查缓存。"""
+        lock, users = self._inflight.get(key, (asyncio.Lock(), 0))
+        self._inflight[key] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            _, users = self._inflight[key]
+            if users == 1:
+                del self._inflight[key]
+            else:
+                self._inflight[key] = (lock, users - 1)
 
     def get(self, key: str) -> CacheEntry | None:
         entry = self._store.get(key)
@@ -57,8 +82,16 @@ class ResultCache:
         if key in self._store:
             self._drop(key)
         self._store[key] = entry
+        paths = {frame.path for frame in entry.frames} | {sheet.path for sheet in entry.sheets}
+        if entry.audio is not None:
+            paths.add(entry.audio.path)
+        size = 0
+        for path in paths:
+            with suppress(OSError):
+                size += path.stat().st_size
+        self._sizes[key] = size
         self._store.move_to_end(key)
-        while len(self._store) > self.capacity:
+        while len(self._store) > self.capacity or sum(self._sizes.values()) > self.max_bytes:
             oldest, _ = next(iter(self._store.items()))
             self._drop(oldest)
 
@@ -73,8 +106,10 @@ class ResultCache:
 
     def _drop(self, key: str) -> None:
         entry = self._store.pop(key, None)
+        self._sizes.pop(key, None)
         if entry is not None and self._on_evict is not None:
             self._on_evict(entry.frames_dir)
+            self._on_evict(entry.sheets_dir)
             if entry.audio is not None:
                 self._on_evict(entry.audio.path)
 
@@ -83,19 +118,23 @@ class ResultCache:
         for frame in entry.frames:
             if not frame.path.exists():
                 return False
+        if any(not sheet.path.exists() for sheet in entry.sheets):
+            return False
         return entry.audio is None or entry.audio.path.exists()
 
 
 def fingerprint(path: Path | None, data: bytes | None, signature: str) -> str:
-    """为一个媒体生成缓存键：内容特征 + 影响产物的配置指纹。"""
+    """流式全内容 SHA-256；路径和时间戳不同不妨碍复用。在线程中调用。"""
+    digest = hashlib.sha256()
     if path is not None:
         try:
-            stat = path.stat()
-            return f"{str(path).casefold()}|{stat.st_size}|{int(stat.st_mtime)}|{signature}"
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
         except OSError:
             return f"{str(path).casefold()}|?|?|{signature}"
-    if data is not None:
-        import hashlib
-
-        return f"bytes|{len(data)}|{hashlib.sha1(data[:262144]).hexdigest()}|{signature}"
-    return f"unknown|{signature}"
+    elif data is not None:
+        digest.update(data)
+    else:
+        return f"unknown|{signature}"
+    return f"sha256:{digest.hexdigest()}|{signature}"

@@ -73,6 +73,11 @@ class MediaItem:
     source_notice: str = ""
     """来源阶段已知的降级说明，例如 B 站视频下载失败但字幕仍可用。"""
 
+    original_image_refs: list[str] = field(default_factory=list)
+    """已核对的原图/宿主宫格引用，成功替换后精确移除。"""
+    original_markers: list[str] = field(default_factory=list)
+    media_id: str = ""
+
     @property
     def display_name(self) -> str:
         return self.name or ("动图" if self.kind is MediaKind.ANIMATION else "视频")
@@ -123,6 +128,16 @@ class AudioClip:
 
     path: Path
     seconds: float
+    start_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class FrameSheet:
+    """一张小宫格及其实际包含的原采样帧。"""
+
+    path: Path
+    frames: tuple[SampledFrame, ...]
+    size_bytes: int
 
 
 @dataclass
@@ -141,6 +156,18 @@ class MediaResult:
     """处理失败或被降级时给模型看的中文说明。"""
     budget_dropped_frames: int = 0
     """本轮预算移除的帧数；全部移除时也要清理原始附件，避免绕过预算。"""
+
+    sheets: list[FrameSheet] = field(default_factory=list)
+    audio_status: str = ""
+
+    @property
+    def images(self) -> list[SampledFrame]:
+        if self.sheets:
+            return [
+                SampledFrame(page.path, i, page.frames[0].timestamp, page.size_bytes)
+                for i, page in enumerate(self.sheets)
+            ]
+        return self.frames
 
     @property
     def kind(self) -> MediaKind:

@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from .animation import AnimationError, sample_animation
+from .audio import is_silent_pcm
 from .budget import frame_allowances
 from .cache import CacheEntry, ResultCache, fingerprint
 from .ffmpeg import FfmpegError, FfmpegRunner
 from .models import MediaItem, MediaKind, MediaResult, SampledFrame, TimeSpan
+from .montage import render_sheets
+from .resources import ResourceLease, protected_thread
 from .sampling import (
     animation_frame_budget,
     audio_clip_seconds,
@@ -52,6 +56,8 @@ class MediaPipeline:
         context: Any,
         log: Any,
         native: Any = None,
+        lease: ResourceLease | None = None,
+        supports_audio: bool = False,
     ) -> None:
         self.settings = settings
         self.runner = runner
@@ -62,6 +68,9 @@ class MediaPipeline:
         self.log = log
         self.native = native
         self._native_auto_used = 0
+        self.lease = lease or ResourceLease()
+        self._owns_lease = lease is None
+        self.supports_audio = supports_audio
 
     # --- 入口 ---------------------------------------------------------------
 
@@ -72,16 +81,58 @@ class MediaPipeline:
         *,
         question: str = "",
     ) -> list[MediaResult]:
+        try:
+            return await self._run(items, span, question=question)
+        finally:
+            if self._owns_lease:
+                self.lease.close()
+
+    async def _run(
+        self,
+        items: list[MediaItem],
+        span: TimeSpan | None = None,
+        *,
+        question: str = "",
+    ) -> list[MediaResult]:
         """处理一批媒体。span 只在「回看某一段」时给出，平时是整片。"""
         results: list[MediaResult] = []
         self._native_auto_used = 0
-        for item in items:
+        for index, item in enumerate(items, 1):
+            if not item.media_id:
+                item.media_id = f"media{index}"
+            self.lease.add(item.path)
             try:
                 results.append(await self._process(item, span, question=question))
             except Exception as exc:  # 任何单个媒体的失败都不该影响整轮对话
                 self.log.warning(f"[MotionVision] 处理 {item.display_name} 时出错: {exc}")
                 results.append(MediaResult(item=item, notice="处理时发生未预期的错误"))
+        originals = [list(result.frames) for result in results]
         self._apply_payload_budget(results)
+        rearranged = False
+        # 一页额度应是全片概览，而不是仅剩前四帧。重排后仍按真实字节再验一次。
+        for result, original in zip(results, originals, strict=True):
+            if not result.sheets or len(result.frames) == len(original):
+                continue
+            selected = [original[i] for i in thin_indices(len(original), len(result.frames))]
+            directory = self.store.frames_dir("overview")
+            self.lease.add(directory)
+            try:
+                pages = await render_sheets(
+                    selected,
+                    directory,
+                    self.settings.preset.max_side,
+                    self.settings.preset.jpeg_quality,
+                )
+            except BaseException as exc:
+                TempStore.discard(directory)
+                if not isinstance(exc, Exception):
+                    raise
+                self.log.warning(f"[MotionVision] 宫格重排失败，保留已有页面: {exc}")
+            else:
+                result.sheets, result.frames = pages, selected
+                rearranged = True
+        if rearranged:
+            self._apply_payload_budget(results)
         return results
 
     # --- 单个媒体 -----------------------------------------------------------
@@ -94,19 +145,41 @@ class MediaPipeline:
         question: str = "",
     ) -> MediaResult:
         window = span if span is not None and span.active else None
-        signature = self.settings.cache_signature
+        signature = (
+            f"{item.kind.value}:{self.settings.cache_signature}:audio-input-{self.supports_audio}"
+        )
         if question.strip() and self.settings.native_video.automatic:
             signature = f"{signature}:q-{question.strip()[:2000]}"
         if window is not None:
             signature = f"{signature}@{window.key}"
 
-        key = fingerprint(item.path, item.data, signature)
+        key = await protected_thread(
+            fingerprint,
+            item.path,
+            item.data,
+            signature,
+            paths=[item.path] if item.path is not None else [],
+        )
         if item.path is None and item.data is None:
             # 只有文字资料的来源（例如 B 站字幕）没有文件指纹，不能全部落到
             # fingerprint() 的 unknown 键上，否则不同视频会互相串缓存。
             key = f"identity:{item.identity}|{signature}"
+        async with self.cache.processing(key):
+            return await self._load_or_process(item, key, window, question)
+
+    async def _load_or_process(
+        self,
+        item: MediaItem,
+        key: str,
+        window: TimeSpan | None,
+        question: str,
+    ) -> MediaResult:
         cached = self.cache.get(key)
         if cached is not None:
+            self.lease.add(cached.frames_dir)
+            self.lease.add(cached.sheets_dir)
+            if cached.audio:
+                self.lease.add(cached.audio.path)
             return MediaResult(
                 item=item,
                 frames=list(cached.frames),
@@ -115,19 +188,44 @@ class MediaPipeline:
                 audio=cached.audio,
                 transcript=cached.transcript,
                 native_report=cached.native_report,
-                notice=cached.notice,
+                notice=_join_notice(item.source_notice, cached.notice),
+                audio_status=cached.audio_status,
+                sheets=list(cached.sheets),
             )
 
+        # 来源说明属于当前消息，不能随按内容共享的解码缓存跨来源复用。
+        processing_item = replace(item, source_notice="")
         if item.kind is MediaKind.ANIMATION:
-            result, entry = await self._process_animation(item)
+            result, entry = await self._process_animation(processing_item)
             if window is not None and result.frames:
                 # 动图整体就那么几十帧，按时间段裁反而更容易漏掉关键动作。
                 result.notice = "动图不支持只看某一段，这里是整段重新取样的结果"
         else:
-            result, entry = await self._process_video(item, window, question=question)
+            result, entry = await self._process_video(processing_item, window, question=question)
+        result.item = item
 
+        if self.settings.injection.frame_layout == "montage" and len(result.frames) > 1:
+            directory = self.store.frames_dir("sheets")
+            self.lease.add(directory)
+            try:
+                result.sheets = await render_sheets(
+                    result.frames,
+                    directory,
+                    self.settings.preset.max_side,
+                    self.settings.preset.jpeg_quality,
+                )
+                if entry is not None:
+                    entry.sheets = list(result.sheets)
+                    entry.sheets_dir = directory
+            except BaseException as exc:
+                TempStore.discard(directory)
+                if not isinstance(exc, Exception):
+                    raise
+                self.log.warning(f"[MotionVision] 宫格生成失败，保留独立帧: {exc}")
         if entry is not None:
+            entry.notice = result.notice
             self.cache.put(key, entry)
+        result.notice = _join_notice(item.source_notice, result.notice)
         return result
 
     async def _process_animation(self, item: MediaItem) -> tuple[MediaResult, CacheEntry | None]:
@@ -137,6 +235,7 @@ class MediaPipeline:
             return (MediaResult(item=item, notice="找不到动图文件"), None)
 
         out_dir = self.store.frames_dir("anim")
+        self.lease.add(out_dir)
 
         def budget(total_frames: int, size_bytes: int, duration: float | None) -> int:
             return animation_frame_budget(
@@ -154,6 +253,9 @@ class MediaPipeline:
         except AnimationError as exc:
             TempStore.discard(out_dir)
             return (MediaResult(item=item, notice=str(exc)), None)
+        except BaseException:
+            TempStore.discard(out_dir)
+            raise
 
         result = MediaResult(
             item=item,
@@ -269,6 +371,7 @@ class MediaPipeline:
             )
 
         frames_dir: Path | None = self.store.frames_dir("video")
+        self.lease.add(frames_dir)
         frames: list[SampledFrame] = []
         notice = item.source_notice
 
@@ -310,7 +413,7 @@ class MediaPipeline:
             TempStore.discard(frames_dir)
             frames_dir = None
 
-        await self._attach_audio(item, probe, result, remaining)
+        await self._attach_audio(item, probe, result, remaining, span)
 
         entry = CacheEntry(
             frames=list(result.frames),
@@ -319,6 +422,7 @@ class MediaPipeline:
             transcript=result.transcript,
             native_report=result.native_report,
             notice=result.notice,
+            audio_status=result.audio_status,
             frames_dir=frames_dir,
         )
         return (result, entry if result.ok else None)
@@ -326,30 +430,69 @@ class MediaPipeline:
     # --- 音频 ---------------------------------------------------------------
 
     async def _attach_audio(
-        self, item: MediaItem, probe: Any, result: MediaResult, remaining: Any
+        self,
+        item: MediaItem,
+        probe: Any,
+        result: MediaResult,
+        remaining: Any,
+        span: TimeSpan | None = None,
     ) -> None:
         audio_cfg = self.settings.audio
-        if not audio_cfg.enabled or not probe.has_audio or item.path is None:
+        if not probe.has_audio:
+            result.audio_status = "no_track"
+            return
+        if not audio_cfg.enabled:
+            result.audio_status = "off"
+            return
+        attach = audio_cfg.attach and self.supports_audio
+        if not attach and not audio_cfg.transcribe:
+            result.audio_status = "unsupported"
+            return
+        if item.path is None:
             return
         if remaining() < 5:
+            result.audio_status = "timeout"
             return
 
         audio_path = self.store.audio_path()
-        seconds = audio_clip_seconds(probe.duration)
+        self.lease.add(audio_path)
+        start = span.start if span is not None else 0.0
+        seconds = audio_clip_seconds(_span_length(probe.duration, span))
+        offset = probe.audio_start - probe.video_start
         try:
             clip = await self.runner.extract_audio(
-                item.path, audio_path, seconds, timeout=max(10.0, remaining())
+                item.path,
+                audio_path,
+                seconds,
+                timeout=max(0.1, remaining()),
+                channels=2,
+                sample_rate=24000,
+                start_seconds=start,
+                audio_offset=offset,
             )
         except FfmpegError as exc:
             self.log.debug(f"[MotionVision] 音轨提取失败: {exc}")
             TempStore.discard(audio_path)
             result.notice = _join_notice(result.notice, "未能读取视频音轨，无法确认其中的声音内容")
+            result.audio_status = "failed"
+            return
+        if await protected_thread(is_silent_pcm, clip.path, paths=[clip.path]):
+            result.audio_status = "silent"
+            TempStore.discard(clip.path)
             return
 
         if audio_cfg.transcribe and remaining() > 3:
+            stt_path = self.store.audio_path()
+            self.lease.add(stt_path)
             try:
+                mono = await self.runner.extract_audio(
+                    clip.path,
+                    stt_path,
+                    clip.seconds,
+                    timeout=max(0.1, remaining()),
+                )
                 result.transcript = await asyncio.wait_for(
-                    transcribe(clip.path, audio_cfg, self.context, self.client),
+                    transcribe(mono.path, audio_cfg, self.context, self.client),
                     timeout=max(1.0, remaining()),
                 )
             except asyncio.TimeoutError:
@@ -357,17 +500,21 @@ class MediaPipeline:
                 result.notice = _join_notice(
                     result.notice, "语音转写超时，无法确认视频中的说话内容"
                 )
-            except SttError as exc:
+            except (SttError, FfmpegError) as exc:
                 self.log.debug(f"[MotionVision] 语音转写失败: {exc}")
                 result.notice = _join_notice(
                     result.notice, "语音转写失败，无法确认视频中的说话内容"
                 )
+            finally:
+                TempStore.discard(stt_path)
 
-        if audio_cfg.attach:
+        if attach:
             result.audio = clip
+            result.audio_status = "ready" if probe.timing_known else "ready_unknown_timing"
         else:
             # 只做转写的话，wav 已经没用了（转写成功与否都一样）。
             TempStore.discard(clip.path)
+            result.audio_status = "unsupported" if audio_cfg.attach else "transcribe_only"
 
     # --- 全局预算 -----------------------------------------------------------
 
@@ -386,7 +533,7 @@ class MediaPipeline:
         original = [len(result.frames) for result in carriers]
 
         allowance = frame_allowances(
-            [[frame.size_bytes or 0 for frame in result.frames] for result in carriers],
+            [[frame.size_bytes or 0 for frame in result.images] for result in carriers],
             [result.kind for result in carriers],
             self.settings.advanced.max_images_per_request,
             self.settings.advanced.max_frame_payload_mb * MB,
@@ -410,6 +557,10 @@ class MediaPipeline:
     @staticmethod
     def _thin(result: MediaResult, keep: int) -> None:
         """把某个媒体的帧数降到 keep，索引重新编号以便标签连续。"""
+        if result.sheets:
+            result.sheets = [result.sheets[i] for i in thin_indices(len(result.sheets), keep)]
+            result.frames = [frame for page in result.sheets for frame in page.frames]
+            return
         frames = result.frames
         keep = max(0, min(keep, len(frames)))
         if keep == len(frames):

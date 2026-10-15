@@ -8,14 +8,19 @@ from __future__ import annotations
 
 import asyncio
 import io
+import math
+import threading
+import time
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image, ImageSequence, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
 from PIL.Image import DecompressionBombError
 
 from .models import SampledFrame
+from .resources import protected_thread
 from .sampling import sample_indices
 
 HEAD_BYTES = 1024
@@ -32,6 +37,14 @@ DEFAULT_FRAME_DELAY_MS = 100.0
 
 MIN_CREDIBLE_DELAY_MS = 20.0
 """小于这个值的帧延时视为「没写」：不少 GIF 会填 0 或 10ms。"""
+
+MAX_SOURCE_FRAMES = 2000
+MAX_DECODE_PIXELS = 400_000_000  # 包括时间线与输出两次遍历
+MAX_SOURCE_BYTES = 32 * 1024 * 1024
+MAX_DECODE_SECONDS = 30.0
+_decode_gates: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 class AnimationError(RuntimeError):
@@ -108,49 +121,75 @@ def _sample_sync(
     max_side: int,
     quality: int,
     budget: Callable[[int, int, float | None], int],
+    cancelled: threading.Event | None = None,
 ) -> AnimationSample:
     size_bytes = len(source) if isinstance(source, bytes) else _size_of(source)
+    if size_bytes > MAX_SOURCE_BYTES:
+        raise AnimationError("动图体积超过 32 MB，已跳过")
+    deadline = time.monotonic() + MAX_DECODE_SECONDS
 
+    def check() -> None:
+        if cancelled is not None and cancelled.is_set():
+            raise AnimationError("动图处理已取消")
+        if time.monotonic() > deadline:
+            raise AnimationError("动图解码超时，已跳过")
+
+    # 不读取 GIF.n_frames：它本身会扫描整个输入，必须让每次 seek 都受保护。
     with _open(source) as image:
         image_format = (image.format or "").upper() or "UNKNOWN"
-        total_frames = int(getattr(image, "n_frames", 1) or 1)
+        pixels = image.width * image.height
+        if pixels > MAX_PIXELS_PER_FRAME:
+            raise AnimationError("图片分辨率过高，已跳过")
+        first = 1 if image.info.get("default_image", False) else 0
+        stamps: list[float] = []
+        elapsed_ms = 0.0
+        for position in range(MAX_SOURCE_FRAMES + 1):
+            check()
+            try:
+                image.seek(first + position)
+            except EOFError:
+                break
+            if position == MAX_SOURCE_FRAMES:
+                raise AnimationError("动图源帧数超过安全上限，已跳过")
+            if (position + 1) * pixels * 2 > MAX_DECODE_PIXELS:
+                raise AnimationError("动图累计解码像素超过安全上限，已跳过")
+            image.load()  # WebP 直到 load 后才更新当前帧 duration。
+            stamps.append(elapsed_ms / 1000.0)
+            elapsed_ms += _frame_delay_ms(image)
+        total_frames = len(stamps)
         if total_frames <= 1:
             raise AnimationError("这张图只有一帧，不需要抽帧")
-        if image.size[0] * image.size[1] > MAX_PIXELS_PER_FRAME:
-            raise AnimationError("图片分辨率过高，已跳过")
-
-        target = budget(total_frames, size_bytes, _estimate_duration(image, total_frames))
+        duration = elapsed_ms / 1000.0
+        target = budget(total_frames, size_bytes, duration)
         wanted = set(sample_indices(total_frames, target))
         if not wanted:
             raise AnimationError("采样帧数为 0，已跳过")
 
         out_dir.mkdir(parents=True, exist_ok=True)
         frames: list[SampledFrame] = []
-        elapsed_ms = 0.0
-        stamps: list[float] = []
-
         # 顺序遍历而不是随机 seek：GIF 的帧是差分存储的，顺序读才能正确合成。
-        for position, raw_frame in enumerate(ImageSequence.Iterator(image)):
+        for position in range(total_frames):
+            check()
+            image.seek(first + position)
             if position in wanted:
-                stamps.append(elapsed_ms / 1000.0)
-                flat = _flatten(raw_frame)
+                flat = _flatten(image)
                 flat.thumbnail((max_side, max_side), Image.LANCZOS)
                 target_path = out_dir / f"f{len(frames):03d}.jpg"
-                flat.save(target_path, format="JPEG", quality=quality, optimize=True)
+                temporary = target_path.with_suffix(".tmp")
+                flat.save(temporary, format="JPEG", quality=quality, optimize=True)
+                temporary.replace(target_path)
                 frames.append(
                     SampledFrame(
                         path=target_path,
                         index=len(frames),
-                        timestamp=stamps[-1],
+                        timestamp=stamps[position],
                         size_bytes=_size_of(target_path),
                     )
                 )
-            elapsed_ms += _frame_delay_ms(raw_frame)
 
     if not frames:
         raise AnimationError("没能抽出任何帧")
 
-    duration = elapsed_ms / 1000.0 if elapsed_ms > 0 else None
     return AnimationSample(
         frames=frames,
         total_frames=total_frames,
@@ -166,8 +205,28 @@ async def sample_animation(
     quality: int,
     budget: Callable[[int, int, float | None], int],
 ) -> AnimationSample:
-    """抽帧并落盘成 JPEG。Pillow 是同步的，整段丢进线程池。"""
-    return await asyncio.to_thread(_sample_sync, source, out_dir, max_side, quality, budget)
+    """有界解码；取消后后台线程仍持有文件与并发名额，直到真正结束。"""
+    loop = asyncio.get_running_loop()
+    gate = _decode_gates.setdefault(loop, asyncio.Semaphore(2))
+    await gate.acquire()
+    cancelled = threading.Event()
+    try:
+        return await protected_thread(
+            _sample_sync,
+            source,
+            out_dir,
+            max_side,
+            quality,
+            budget,
+            cancelled,
+            paths=[out_dir, *([source] if isinstance(source, Path) else [])],
+            on_finished=gate.release,
+        )
+    except asyncio.CancelledError:
+        cancelled.set()
+        raise
+    except (OSError, ValueError, EOFError) as exc:
+        raise AnimationError("动图损坏或帧数据不完整，已跳过") from exc
 
 
 def _frame_delay_ms(frame: Image.Image) -> float:
@@ -180,18 +239,12 @@ def _frame_delay_ms(frame: Image.Image) -> float:
         delay = float(frame.info.get("duration") or 0.0)
     except (TypeError, ValueError):
         delay = 0.0
-    return delay if delay >= MIN_CREDIBLE_DELAY_MS else DEFAULT_FRAME_DELAY_MS
+    minimum = MIN_CREDIBLE_DELAY_MS if image_format_of(frame) == "GIF" else 0.001
+    return delay if math.isfinite(delay) and delay >= minimum else DEFAULT_FRAME_DELAY_MS
 
 
-def _estimate_duration(image: Image.Image, total_frames: int) -> float | None:
-    """在真正遍历之前估个总时长，供帧数预算参考。
-
-    只看第一帧的延时再乘帧数：绝大多数动图的帧延时是统一的，而逐帧读延时
-    等于把整张图解码两遍。估得准不准只影响「抽几帧」，不影响帧本身的时间戳
-    ——那个是遍历时按真实延时累加出来的。
-    """
-    seconds = total_frames * _frame_delay_ms(image) / 1000.0
-    return seconds if seconds > 0 else None
+def image_format_of(frame: Image.Image) -> str:
+    return (frame.format or "").upper()
 
 
 def _size_of(path: Path) -> int:

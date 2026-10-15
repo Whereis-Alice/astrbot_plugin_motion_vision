@@ -32,6 +32,7 @@ def test_animation_budget_respects_source_length():
     assert animation_frame_budget(0, 0, preset) == 0
     # 只有 3 帧的动图不可能抽出 6 帧
     assert animation_frame_budget(3, 0, preset) == 3
+    assert animation_frame_budget(4, 0, preset, duration=1.0) == 4
 
 
 def test_animation_budget_follows_duration_not_just_a_flat_count():

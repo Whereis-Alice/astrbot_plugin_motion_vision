@@ -42,7 +42,7 @@ def coerce_frames(value: Any) -> int:
 def make_span(kind: MediaKind, start: Any, end: Any) -> TimeSpan | None:
     """把起止秒数变成 TimeSpan，None 表示整段。
 
-    动图没有可靠的时间轴（每帧延时都可能不同），分段意义不大，一律整段重看。
+    动图通常很短，仍按整段回看以保留动作上下文。
     区间写反、写空、写成负数也都退回整段，而不是报错。
     """
     if kind is not MediaKind.VIDEO:
@@ -111,7 +111,11 @@ def build_payload(name: str, token: str, result: MediaResult, span: TimeSpan | N
         return summary + "（当前环境没法直接回传图片，只能给出这段说明。）"
 
     content: list[Any] = [TextContent(type="text", text=summary)]
-    for frame in result.frames:
+    if result.sheets:
+        content.append(
+            TextContent(type="text", text="画面以四帧小宫格分页，从左到右、从上到下阅读。")
+        )
+    for frame in result.images:
         try:
             payload = base64.b64encode(frame.path.read_bytes()).decode("ascii")
         except OSError:

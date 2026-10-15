@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+import weakref
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
 from .motion_vision.animation import guess_suffix
+from .motion_vision.audio import provider_supports_audio
 from .motion_vision.bilibili import (
     BilibiliClient,
     BilibiliError,
@@ -47,6 +49,7 @@ from .motion_vision.models import ContextEvidence, MediaItem, MediaKind, MediaRe
 from .motion_vision.native_video import NativeVideoAnalyzer
 from .motion_vision.pipeline import MediaPipeline
 from .motion_vision.registry import MediaRecord, MediaRegistry, build_memo
+from .motion_vision.resources import ResourceLease, protected_thread
 from .motion_vision.review import build_payload, make_span, tune_settings
 from .motion_vision.settings import (
     AUDIO_LABELS,
@@ -89,7 +92,7 @@ MEDIA_LIST_TOOL_NAME = "list_motion_media"
     PLUGIN_NAME,
     "Whereis-Alice",
     "让大模型读懂动图和视频：自动抽取关键帧、可选提取语音，再连同说明一起交给模型。",
-    "0.6.1",
+    "0.7.0",
     "https://github.com/Whereis-Alice/astrbot_plugin_motion_vision",
 )
 class MotionVisionPlugin(Star):
@@ -110,6 +113,9 @@ class MotionVisionPlugin(Star):
             limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
         )
         self._gate = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        self._request_leases: weakref.WeakKeyDictionary[AstrMessageEvent, ResourceLease] = (
+            weakref.WeakKeyDictionary()
+        )
         try:
             self.data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         except Exception:
@@ -223,7 +229,11 @@ class MotionVisionPlugin(Star):
         try:
             async with self._gate:
                 await self._handle(event, req, settings)
+        except asyncio.CancelledError:
+            self._release_request(event)
+            raise
         except Exception as exc:
+            self._release_request(event)
             logger.error(
                 f"{LOG_TAG} 处理动态媒体时出错: {exc}", exc_info=settings.advanced.debug_log
             )
@@ -231,15 +241,23 @@ class MotionVisionPlugin(Star):
     async def _handle(
         self, event: AstrMessageEvent, req: ProviderRequest, settings: Settings
     ) -> None:
+        lease = self._lease_for(event)
         self.store.sweep()
 
         items, notices, evidence = await self._collect(event, req, settings)
         if not items and not notices and not evidence:
+            self._release_request(event)
             return
 
         question = self._question(event, req)
         results: list[MediaResult] = (
-            await self._pipeline(settings).run(items, question=question) if items else []
+            await self._pipeline(
+                settings,
+                lease=lease,
+                supports_audio=provider_supports_audio(self.context, event),
+            ).run(items, question=question)
+            if items
+            else []
         )
         results.extend(
             MediaResult(item=MediaItem(MediaKind.VIDEO, name, name, None), notice=reason)
@@ -251,7 +269,13 @@ class MotionVisionPlugin(Star):
         if report.touched:
             logger.info(f"{LOG_TAG} 已注入 {report}")
 
-    def _pipeline(self, settings: Settings) -> MediaPipeline:
+    def _pipeline(
+        self,
+        settings: Settings,
+        *,
+        lease: ResourceLease | None = None,
+        supports_audio: bool = False,
+    ) -> MediaPipeline:
         """流水线是无状态的，每次按当前配置现搭一个，热更新才能立刻生效。"""
         return MediaPipeline(
             settings=settings,
@@ -262,7 +286,29 @@ class MotionVisionPlugin(Star):
             context=self.context,
             log=logger,
             native=self.native_video,
+            lease=lease,
+            supports_audio=supports_audio,
         )
+
+    def _lease_for(self, event: AstrMessageEvent) -> ResourceLease:
+        lease = self._request_leases.get(event)
+        if lease is None:
+            lease = ResourceLease()
+            lease.add(self.store.base)
+            self._request_leases[event] = lease
+            # 失败请求可能不触发响应钩子；事件被回收时仍释放资源。
+            weakref.finalize(event, lease.close)
+        return lease
+
+    def _release_request(self, event: AstrMessageEvent) -> None:
+        lease = self._request_leases.pop(event, None)
+        if lease is not None:
+            lease.close()
+
+    @filter.on_llm_response()
+    async def release_media_request(self, event: AstrMessageEvent, _response: Any) -> None:
+        """模型已结束读取本轮媒体后，允许清理过期文件。"""
+        self._release_request(event)
 
     # --- 来源收集 -----------------------------------------------------------
 
@@ -277,7 +323,7 @@ class MotionVisionPlugin(Star):
         # 有些 OneBot 网关只把被引用消息的 ID 交给 AstrBot，不展开原消息。
         # 先做一次有界、只读的补取，后面的卡片、B 站和视频收集器共享结果，
         # 避免每个模块各自调用 get_msg 造成重复请求。
-        if settings.cards.enabled or settings.bilibili.enabled:
+        if settings.cards.enabled or settings.bilibili.enabled or settings.animation.enabled:
             await hydrate_event_cards(event)
 
         if settings.cards.enabled:
@@ -301,6 +347,7 @@ class MotionVisionPlugin(Star):
                     self.client,
                     search_dirs=search_dirs,
                     on_skip=lambda name, reason: notices.append((name, reason)),
+                    download_path_factory=self.store.download_path,
                 )
             )
 
@@ -448,7 +495,7 @@ class MotionVisionPlugin(Star):
             return None
 
         try:
-            return self.registry.remember(
+            record = self.registry.remember(
                 session,
                 item.kind,
                 item.display_name,
@@ -460,6 +507,8 @@ class MotionVisionPlugin(Star):
                 frames_seen=len(result.frames),
                 owned_temp=item.owned_temp or spilled,
             )
+            item.media_id = record.token
+            return record
         except Exception as exc:
             logger.debug(f"{LOG_TAG} 登记媒体失败: {exc}")
             return None
@@ -573,6 +622,8 @@ class MotionVisionPlugin(Star):
         if not settings.review.enabled:
             return "回看功能当前是关闭的，没法重新调取画面。"
 
+        self._lease_for(event)
+
         session = self._session(event)
         record = self.registry.find(session, media_id)
         if record is None:
@@ -595,7 +646,10 @@ class MotionVisionPlugin(Star):
             context_label=record.context_label,
         )
         async with self._gate:
-            results = await self._pipeline(tune_settings(settings, frames)).run([item], span=span)
+            results = await self._pipeline(
+                tune_settings(settings, frames),
+                lease=self._lease_for(event),
+            ).run([item], span=span)
 
         result = results[0]
         if not result.frames:
@@ -604,8 +658,13 @@ class MotionVisionPlugin(Star):
         record.reviews += 1
         record.frames_seen = max(record.frames_seen, len(result.frames))
         logger.info(f"{LOG_TAG} 回看 {record.token}：{len(result.frames)} 帧")
-        return await asyncio.to_thread(
-            build_payload, record.display_name, record.token, result, span
+        return await protected_thread(
+            build_payload,
+            record.display_name,
+            record.token,
+            result,
+            span,
+            paths=[frame.path for frame in result.images],
         )
 
     @filter.llm_tool(name=MEDIA_LIST_TOOL_NAME)
@@ -638,6 +697,8 @@ class MotionVisionPlugin(Star):
         if not settings.review.enabled:
             return "要按编号整片分析视频，请先打开「回看」功能。"
 
+        self._lease_for(event)
+
         session = self._session(event)
         record = self.registry.find(session, media_id)
         if record is None:
@@ -664,7 +725,10 @@ class MotionVisionPlugin(Star):
                     settings,
                     native_video=replace(settings.native_video, mode="off"),
                 )
-                fallback = await self._pipeline(fallback_settings).run(
+                fallback = await self._pipeline(
+                    fallback_settings,
+                    lease=self._lease_for(event),
+                ).run(
                     [
                         MediaItem(
                             kind=record.kind,
@@ -681,12 +745,13 @@ class MotionVisionPlugin(Star):
                 result = fallback[0] if fallback else None
                 if result is None or not result.frames:
                     return self.native_video.user_error(exc)
-                return await asyncio.to_thread(
+                return await protected_thread(
                     build_payload,
                     record.display_name,
                     record.token,
                     result,
                     None,
+                    paths=[frame.path for frame in result.images],
                 )
         return (
             f"【整片视频模型报告｜{record.display_name}】以下是专用视频模型对整段视频的辅助报告，"
@@ -1000,10 +1065,10 @@ class MotionVisionPlugin(Star):
         """清空结果缓存、媒体档案和临时文件。"""
         self.cache.clear()
         forgotten = self.registry.clear()
-        removed = self.store.sweep(min_interval=0.0)
-        TempStore.discard(self.store.base)
+        removed = self.store.clear()
         yield event.plain_result(
-            f"已清空结果缓存与 {forgotten} 条媒体档案，并清理了 {removed} 项临时文件。"
+            f"已清空结果缓存与 {forgotten} 条媒体档案，申请清理 {removed} 项临时文件。"
+            "仍在使用的文件会在请求或后台任务结束后删除。"
         )
 
     # --- 生命周期 -----------------------------------------------------------
@@ -1017,6 +1082,8 @@ class MotionVisionPlugin(Star):
         await self.bilibili.close()
         with contextlib.suppress(Exception):
             await self.client.aclose()
+        # 卸载时主模型可能还在读图片；保留事件 finalizer 的租约，不能强制删文件。
+        self._request_leases.clear()
         logger.info(f"{LOG_TAG} 已卸载")
 
 

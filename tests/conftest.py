@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from pathlib import Path
@@ -26,6 +27,8 @@ def _module(name: str) -> types.ModuleType:
 
 def _install_stubs() -> None:
     try:
+        if os.environ.get("MOTION_VISION_TEST_STUBS") == "1":
+            raise ImportError("use isolated AstrBot test doubles")
         import astrbot.core.agent.message  # noqa: F401
     except Exception:
         pass
