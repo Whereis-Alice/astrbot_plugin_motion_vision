@@ -13,6 +13,8 @@ from dataclasses import replace
 from typing import Any
 
 from ..bilibili import BilibiliClient, BilibiliError, extract_event_references
+from ..bilibili_article import RESOLVED_SHORTS_ATTR
+from ..bilibili_parser import parse_reference
 from ..cards import REMOTE_ATTEMPTED_ATTR
 from ..models import MediaItem
 from ..settings import BilibiliSettings
@@ -51,6 +53,22 @@ class BilibiliCollector:
             return result
 
         references = await self._references()
+        targets = getattr(self.event, RESOLVED_SHORTS_ATTR, {})
+        routed = []
+        for reference in references:
+            if reference.kind == "short_url" and reference.value in targets:
+                target = parse_reference(targets[reference.value])
+                if target is None:
+                    continue
+                reference = replace(
+                    target,
+                    title=reference.title,
+                    description=reference.description,
+                    author=reference.author,
+                    quoted=reference.quoted,
+                )
+            routed.append(reference)
+        references = routed
         seen: set[str] = set()
         for reference in references:
             if len(result.items) >= self.max_videos:

@@ -51,6 +51,11 @@ class InjectionReport:
     notices: int = 0
     memo: bool = False
     evidence: int = 0
+    article_bodies: int = 0
+    article_metadata: int = 0
+    evidence_failures: int = 0
+    evidence_chars: int = 0
+    source_contexts: int = 0
 
     @property
     def touched(self) -> bool:
@@ -61,6 +66,9 @@ class InjectionReport:
             f"{self.media} 个媒体 / {self.frames} 帧"
             f" / {self.audio} 段音轨 / {self.transcripts} 条转写"
             f" / {self.evidence} 条外部资料"
+            f"（正文 {self.article_bodies} / 仅元数据 {self.article_metadata}"
+            f" / 失败 {self.evidence_failures} / 正文 {self.evidence_chars} 字符）"
+            f" / {self.source_contexts} 条媒体资料"
         )
 
 
@@ -95,7 +103,7 @@ def inject(
     parts: list[Any] = _ensure_parts(request)
     add = _appender(parts, temporary=not keep)
 
-    if usable:
+    if any(result.frames for result in usable):
         add(_text(HEADER))
 
     for result in usable:
@@ -105,7 +113,7 @@ def inject(
 
         if result.item.context_text:
             add(_text(result.item.context_text))
-            report.transcripts += 1
+            report.source_contexts += 1
 
         if result.frames:
             if keep:
@@ -156,6 +164,12 @@ def inject(
                 )
             )
         report.evidence += 1
+        report.article_bodies += item.status == "body"
+        report.article_metadata += item.status == "metadata"
+        report.evidence_failures += item.status == "failed"
+        report.evidence_chars += item.content_chars
+        if item.memo:
+            parts.append(_text(item.memo))
 
     if notices:
         add(_text(describe_notices(notices)))

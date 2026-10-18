@@ -48,6 +48,11 @@ def test_article_service_reads_multiple_articles_and_keeps_cookie_off_cover(
             )
         if request.url.path.endswith("cover.jpg"):
             return httpx.Response(200, content=b"not-an-image")
+        if request.url.path.startswith("/opus/"):
+            return httpx.Response(
+                200,
+                text='<title>Article 456</title><div class="opus-module-content"><p>正文</p></div>',
+            )
         return httpx.Response(404)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))

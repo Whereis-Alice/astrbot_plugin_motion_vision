@@ -179,6 +179,12 @@
         "default": true,
         "hint": "仅下载 B 站允许的图片域名；封面是辅助证据，不代表正文事实。"
       },
+      "article_max_chars": {
+        "description": "自动注入专栏正文字符上限",
+        "type": "int",
+        "default": 20000,
+        "hint": "范围 1000–60000；超出时明确标记省略，模型可用 read_bilibili_article 分页通读。"
+      },
       "cookie": {
         "description": "B 站 Cookie（可选）",
         "type": "string",

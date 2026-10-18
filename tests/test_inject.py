@@ -222,7 +222,8 @@ def test_text_only_source_context_is_injected(tmp_path: Path) -> None:
 
     assert report.media == 1
     assert report.frames == 0
-    assert report.transcripts == 1
+    assert report.transcripts == 0
+    assert report.source_contexts == 1
     assert any("测试视频" in text for text in _texts(request))
 
 

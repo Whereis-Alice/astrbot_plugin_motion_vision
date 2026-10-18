@@ -44,6 +44,7 @@ motion_vision/
   bilibili_client.py      B 站元数据、字幕缓存、限流和下载协调
   bilibili_transcript.py  官方字幕与必剪回退
   bilibili_article.py     B 站专栏正文和封面
+  article_parse.py        专栏 HTML、旧页面状态和 Opus 结构化段落
   bilibili_qr_login.py    扫码登录与凭据隔离
   cards.py                通用引用卡片解析与有界回查
   registry.py             会话媒体档案和回看编号
@@ -92,6 +93,10 @@ motion_vision/
 B 站 Cookie 只用于 B 站相关请求；必剪音频上传使用独立客户端，不应携带 B 站凭据。日志、状态和用户可见错误不能泄露密钥。
 
 ## 排错
+
+注入日志的“外部资料条数”不代表已读取正文。0.8.0 起会分别统计正文、仅元数据、失败和正文字符数，每篇资料也有 `状态=body/metadata/failed` 日志；标题、密钥和正文不写入这类日志。“媒体资料”表示视频元数据或字幕上下文，“转写”表示单独的语音转写/模型报告。
+
+专栏应能看到 `状态=body` 与非零正文字符数；若只有 `metadata`，检查页面访问、登录态及是否遇到 B 站验证。QQ 卡片通过 `message_obj.raw_message`、标准组件或有界 `get_msg` 回查提取；自动注入和分页阅读都使用用户内容，避免改写系统提示词。
 
 ### 视频没有画面
 

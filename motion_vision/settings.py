@@ -165,6 +165,9 @@ class BilibiliSettings:
     article_cover_enabled: bool = True
     """是否把可信的 B 站专栏封面作为本轮图片资料。"""
 
+    article_max_chars: int = 20000
+    """自动注入的专栏正文字符上限，剩余正文可按需分页读取。"""
+
     subtitle_fallback: str = "off"
     """官方字幕不可用时的回退：off / bcut。"""
 
@@ -464,6 +467,7 @@ def load_settings(config: Any) -> Settings:
             subtitle_language=_subtitle_language(bilibili.get("subtitle_language")),
             article_enabled=_as_bool(bilibili.get("article_enabled"), True),
             article_cover_enabled=_as_bool(bilibili.get("article_cover_enabled"), True),
+            article_max_chars=_as_int(bilibili.get("article_max_chars"), 20000, 1000, 60000),
             subtitle_fallback=_as_choice(
                 bilibili.get("subtitle_fallback"),
                 ("off", "bcut"),

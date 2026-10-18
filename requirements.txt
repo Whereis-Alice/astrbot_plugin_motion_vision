@@ -1,4 +1,5 @@
 pillow>=10.0.0
 httpx>=0.27.0
+beautifulsoup4>=4.12,<5
 yt-dlp>=2025.1
 qrcode[pil]>=7.4,<9

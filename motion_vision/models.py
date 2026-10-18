@@ -195,3 +195,8 @@ class ContextEvidence:
     label: str
     text: str = ""
     images: tuple[str, ...] = ()
+    status: str = ""
+    """正文 body、仅元数据 metadata、失败 failed；普通卡片留空。"""
+    content_chars: int = 0
+    memo: str = ""
+    """可持久化的短标题、来源链接和回读提示，正文仍为本轮临时资料。"""
